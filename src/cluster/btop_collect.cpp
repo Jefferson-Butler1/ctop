@@ -90,8 +90,10 @@ namespace Cluster {
 		time_t start{};
 	};
 
-	vector<Node> nodes;
-	uint64_t last_refresh = 0;
+	//? The collectors read `nodes` on the runner thread; the scrape thread fills `scraped`, and refresh() hands it over
+	vector<Node> nodes, scraped;
+	std::mutex scrape_mutex;
+	bool fresh = false;
 
 	std::mutex pods_mutex;
 	vector<Pod> pods;
@@ -188,19 +190,19 @@ namespace Cluster {
 		return s;
 	}
 
-	//* Scrape every node in parallel, at most once per update so the cpu, mem and net collectors share a scrape
-	void refresh() {
-		const auto now = time_ms();
-		if (now - last_refresh < (uint64_t)Config::getI("update_ms") / 2) return;
-		last_refresh = now;
+	//? Only the collectors ctop reads; the full exporter output is several times larger and slower to produce
+	constexpr auto collectors = "collect[]=cpu&collect[]=meminfo&collect[]=loadavg&collect[]=netdev"
+		"&collect[]=diskstats&collect[]=filesystem&collect[]=stat";
 
+	//* Scrape every node in parallel
+	void scrape(vector<Node>& into) {
 		vector<std::future<string>> scrapes;
-		for (const auto& node : nodes)
+		for (const auto& node : into)
 			scrapes.push_back(std::async(std::launch::async, run,
-				fmt::format("curl -s --max-time 1 http://{}:{}/metrics 2>/dev/null", node.addr, exporter_port)));
+				fmt::format("curl -sg --max-time 2 'http://{}:{}/metrics?{}' 2>/dev/null", node.addr, exporter_port, collectors)));
 
-		for (size_t i = 0; i < nodes.size(); i++) {
-			auto& node = nodes[i];
+		for (size_t i = 0; i < into.size(); i++) {
+			auto& node = into[i];
 			auto sample = parse(scrapes[i].get());
 			node.up = sample.ok;
 			//? A down node keeps its last sample, so cluster totals don't dip and spike around an outage
@@ -208,6 +210,35 @@ namespace Cluster {
 				node.prev = std::move(node.cur);
 				node.cur = std::move(sample);
 			}
+		}
+	}
+
+	//? A scrape takes up to ~200ms, so it runs off the runner thread and drawing and input never wait on the network
+	void scrape_loop() {
+		while (not Global::quitting) {
+			const auto start = time_ms();
+			vector<Node> work;
+			{
+				std::lock_guard lock(scrape_mutex);
+				work = scraped;
+			}
+			scrape(work);
+			{
+				std::lock_guard lock(scrape_mutex);
+				scraped = std::move(work);
+				fresh = true;
+			}
+			while (not Global::quitting and time_ms() - start < (uint64_t)Config::getI("update_ms"))
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		}
+	}
+
+	//* Pick up the latest scrape, if there's a new one
+	void refresh() {
+		std::lock_guard lock(scrape_mutex);
+		if (fresh) {
+			nodes = scraped;
+			fresh = false;
 		}
 	}
 
@@ -306,7 +337,7 @@ namespace Shared {
 		}
 
 		//? Core count is fixed at startup, like btop: nodes unreachable now contribute no cores
-		Cluster::refresh();
+		Cluster::scrape(nodes);
 		coreCount = 0;
 		for (auto& node : nodes) {
 			node.cores = node.cur.cpu.size();
@@ -325,6 +356,8 @@ namespace Shared {
 
 		Mem::collect();
 
+		Cluster::scraped = nodes;
+		std::thread(Cluster::scrape_loop).detach();
 		std::thread(Cluster::pods_loop).detach();
 	}
 } // namespace Shared
