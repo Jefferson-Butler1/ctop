@@ -142,7 +142,7 @@ void term_resize(bool force) {
 	}
 	else return;
 #if defined(CTOP_CLUSTER)
-	static const array<string, 10> all_boxes = {"gpu4", "cpu", "mem", "net", "proc", "node", "gpu0", "gpu1", "gpu2", "gpu3"};
+	static const array<string, 10> all_boxes = {"gpu3", "cpu", "mem", "net", "proc", "node", "storage", "gpu0", "gpu1", "gpu2"};
 #elif defined(GPU_SUPPORT)
 	static const array<string, 10> all_boxes = {"gpu5", "cpu", "mem", "net", "proc", "gpu0", "gpu1", "gpu2", "gpu3", "gpu4"};
 #else
@@ -188,7 +188,7 @@ void term_resize(bool force) {
 				else if (key.size() == 1 and isint(key)) {
 					auto intKey = stoi(key);
 				#if defined(CTOP_CLUSTER)
-					if ((intKey == 0 and Gpu::count >= 5) or intKey == 5 or (intKey >= 6 and intKey - 5 <= Gpu::count)) {
+					if ((intKey == 0 and Gpu::count >= 4) or intKey == 5 or intKey == 6 or (intKey >= 7 and intKey - 6 <= Gpu::count)) {
 				#elif defined(GPU_SUPPORT)
 					if ((intKey == 0 and Gpu::count >= 5) or (intKey >= 5 and intKey - 4 <= Gpu::count)) {
 				#else
@@ -636,6 +636,17 @@ namespace Runner {
 					}
 					catch (const std::exception& e) {
 						throw std::runtime_error("Nodes:: -> " + string{e.what()});
+					}
+				}
+
+				//? STORAGE
+				if (v_contains(conf.boxes, "storage") and v_contains(conf.boxes, "proc")) {
+					try {
+						auto rows = Storage::collect(conf.no_update);
+						if (not pause_output) output += Storage::draw(rows, conf.force_redraw, conf.no_update);
+					}
+					catch (const std::exception& e) {
+						throw std::runtime_error("Storage:: -> " + string{e.what()});
 					}
 				}
 			#endif

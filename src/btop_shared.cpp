@@ -250,7 +250,12 @@ bool set_priority(pid_t pid, int priority) {
 				filter_found++;
 				p.filtered = true;
 			}
+		#ifdef CTOP_CLUSTER
+			//? ctop's parents are namespaces and workloads, which only have their pods' usage to show
+			else if (not no_update and p.state != 'X') {
+		#else
 			else if (not no_update and Config::getB("proc_aggregate") and p.state != 'X') {
+		#endif
 				cur_proc.cpu_p += p.cpu_p;
 				cur_proc.cpu_c += p.cpu_c;
 				cur_proc.mem += p.mem;
@@ -279,15 +284,21 @@ bool set_priority(pid_t pid, int priority) {
 			pid_set.insert(p.pid);
 			parent_pids.insert(static_cast<size_t>(p.ppid));
 		}
+	#ifdef CTOP_CLUSTER
+		//? ctop's roots are namespaces, which collapse like any other parent
+		const bool keep_roots = false;
+	#else
+		const bool keep_roots = true;
+	#endif
 		//? If any non-root parent is expanded, collapse; otherwise expand
-		const bool do_collapse = rng::any_of(current_procs, [&parent_pids, &pid_set](const proc_info& p) {
+		const bool do_collapse = rng::any_of(current_procs, [&](const proc_info& p) {
 			return parent_pids.contains(p.pid)
-				and pid_set.contains(static_cast<size_t>(p.ppid))
+				and (not keep_roots or pid_set.contains(static_cast<size_t>(p.ppid)))
 				and not p.collapsed;
 		});
 		//? Root processes (parent not in tracked list) are never touched
 		for (auto& p : current_procs) {
-			if (not pid_set.contains(static_cast<size_t>(p.ppid))) continue;
+			if (keep_roots and not pid_set.contains(static_cast<size_t>(p.ppid))) continue;
 			p.collapsed = do_collapse;
 		}
 	}

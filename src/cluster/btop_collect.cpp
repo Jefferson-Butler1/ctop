@@ -19,7 +19,8 @@ tab-size = 4
 //* ctop cluster backend: the same collectors as the per-OS backends, fed from every node's node-exporter
 //* and the Kubernetes API instead of the local machine. The cluster reads as one big machine: all cores
 //* appended, memory summed, one disk per node filesystem, one net "interface" per node plus a cluster
-//* total, a box of nodes, every node's NVIDIA GPUs (from dcgm-exporter) and pods in place of processes.
+//* total, a box of nodes, a box of storage backends (Ceph, Longhorn), every node's NVIDIA GPUs (from
+//* dcgm-exporter) and pods in place of processes.
 
 #include <chrono>
 #include <cmath>
@@ -27,6 +28,7 @@ tab-size = 4
 #include <ctime>
 #include <future>
 #include <iomanip>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <ranges>
@@ -85,6 +87,7 @@ namespace Cluster {
 
 	struct Pod {
 		string ns, name, node, phase, images;
+		string kind, workload; // owning workload, empty for bare pods
 		size_t containers{};
 		double cpu{}, mem{}; // cores, bytes
 		time_t start{};
@@ -273,13 +276,25 @@ namespace Cluster {
 		std::unordered_map<string, size_t> index;
 		std::istringstream list(run("kubectl get pods -A --no-headers -o custom-columns="
 			"NS:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,"
-			"START:.status.startTime,IMAGES:.spec.containers[*].image 2>/dev/null"));
+			"START:.status.startTime,KIND:.metadata.ownerReferences[0].kind,OWNER:.metadata.ownerReferences[0].name,"
+			"IMAGES:.spec.containers[*].image 2>/dev/null"));
 		for (string line; std::getline(list, line);) {
 			std::istringstream fields(line);
 			Pod pod;
 			string start;
-			if (not (fields >> pod.ns >> pod.name >> pod.node >> pod.phase >> start >> pod.images)) continue;
+			if (not (fields >> pod.ns >> pod.name >> pod.node >> pod.phase >> start >> pod.kind >> pod.workload >> pod.images)) continue;
 			if (is_in(pod.phase, "Succeeded", "Failed")) continue;
+			//? Name the workload a person made: a ReplicaSet's Deployment, a scheduled Job's CronJob
+			auto suffix = [&] { return pod.workload.substr(pod.workload.rfind('-') + 1); };
+			if (pod.kind == "<none>") pod.kind = pod.workload = "";
+			else if (pod.kind == "ReplicaSet" and pod.workload.contains('-')) {
+				pod.kind = "Deployment";
+				pod.workload.resize(pod.workload.rfind('-'));
+			}
+			else if (pod.kind == "Job" and pod.workload.contains('-') and rng::all_of(suffix(), ::isdigit)) {
+				pod.kind = "CronJob";
+				pod.workload.resize(pod.workload.rfind('-'));
+			}
 			pod.containers = rng::count(pod.images, ',') + 1;
 			std::tm tm{};
 			std::istringstream(start) >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
@@ -319,32 +334,36 @@ namespace Cluster {
 		std::unordered_map<string, double> fields; // DCGM_FI_DEV_<field>
 	};
 
-	//? dcgm-exporter pods aren't reachable from outside the cluster, so they're read through the API server proxy
+	//? Exporter pods aren't reachable from outside the cluster, so they're read through the API server proxy
 	struct Exporter {
 		string ns, pod, node;
 	};
+
+	vector<Exporter> find_exporters(string_view selector) {
+		vector<Exporter> out;
+		std::istringstream list(run(fmt::format("kubectl get pods -A -l {} --field-selector=status.phase=Running --no-headers "
+			"-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName 2>/dev/null", selector)));
+		for (string line; std::getline(list, line);) {
+			std::istringstream fields(line);
+			Exporter e;
+			if (fields >> e.ns >> e.pod >> e.node) out.push_back(std::move(e));
+		}
+		return out;
+	}
+
+	string proxy_metrics(const Exporter& e, int port) {
+		return run(fmt::format("kubectl get --raw /api/v1/namespaces/{}/pods/{}:{}/proxy/metrics 2>/dev/null", e.ns, e.pod, port));
+	}
 
 	vector<Exporter> exporters;
 	std::mutex gpus_mutex;
 	vector<GpuSample> gpu_samples;
 
-	void find_exporters() {
-		exporters.clear();
-		std::istringstream list(run("kubectl get pods -A -l app=nvidia-dcgm-exporter --no-headers "
-			"-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName 2>/dev/null"));
-		for (string line; std::getline(list, line);) {
-			std::istringstream fields(line);
-			Exporter e;
-			if (fields >> e.ns >> e.pod >> e.node) exporters.push_back(std::move(e));
-		}
-	}
-
 	//* Fetch every exporter in parallel; false if any of them failed
 	bool fetch_gpus(vector<GpuSample>& out) {
 		vector<std::future<string>> fetches;
 		for (const auto& e : exporters)
-			fetches.push_back(std::async(std::launch::async, run,
-				fmt::format("kubectl get --raw /api/v1/namespaces/{}/pods/{}:9400/proxy/metrics 2>/dev/null", e.ns, e.pod)));
+			fetches.push_back(std::async(std::launch::async, proxy_metrics, e, 9400));
 
 		bool ok = true;
 		for (size_t i = 0; i < exporters.size(); i++) {
@@ -375,13 +394,172 @@ namespace Cluster {
 			const auto start = time_ms();
 			vector<GpuSample> fresh;
 			//? Exporter pods get replaced on upgrades and restarts; look them up again when one stops answering
-			if (not fetch_gpus(fresh)) find_exporters();
+			if (not fetch_gpus(fresh)) exporters = find_exporters("app=nvidia-dcgm-exporter");
 			{
 				std::lock_guard lock(gpus_mutex);
 				gpu_samples = std::move(fresh);
 			}
 			//? dcgm-exporter samples at most once a second, so polling faster only spawns kubectl for repeats
 			while (not Global::quitting and time_ms() - start < max<uint64_t>(Config::getI("update_ms"), 1000))
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		}
+	}
+
+	//* Call fn(name, labels, value) for every sample line of a Prometheus text exposition
+	template <typename Fn>
+	void for_each_metric(string_view text, Fn&& fn) {
+		while (not text.empty()) {
+			const auto eol = text.find('\n');
+			const auto line = text.substr(0, eol);
+			text = (eol == string_view::npos ? string_view{} : text.substr(eol + 1));
+			const auto space = line.rfind(' ');
+			if (line.starts_with('#') or space == string_view::npos) continue;
+			const auto head = line.substr(0, space);
+			const auto brace = min(head.find('{'), head.size());
+			fn(head.substr(0, brace), head.substr(brace), std::strtod(string(line.substr(space + 1)).c_str(), nullptr));
+		}
+	}
+
+	//? Ceph's mgr refreshes its counters every ~15s, so a rate spans the last two changes rather than the last two polls
+	struct Counter {
+		double val = -1, rate{};
+		uint64_t at{}; // when val last changed, 0 until a change has been seen
+	};
+
+	void advance(Counter& c, double val, uint64_t now) {
+		if (val == c.val) return;
+		if (c.at > 0) c.rate = max(0.0, val - c.val) / ((now - c.at) / 1000.0);
+		//? The first value seen didn't change at `now`, so it can't start a rate
+		c.at = (c.val < 0 ? 0 : now);
+		c.val = val;
+	}
+
+	vector<Exporter> longhorn_managers;
+	std::unordered_map<string, Counter> ceph_counters; // "<pool id> rd" / "<pool id> wr"
+	std::mutex storage_mutex;
+	vector<Storage::storage_info> storage;
+
+	//? Ceph pools smaller than this (rgw bookkeeping, .mgr, metadata) would bury the ones holding data
+	constexpr double min_pool_bytes = 1 << 30;
+
+	void add_ceph(string_view text, vector<Storage::storage_info>& out) {
+		struct Pool {
+			string name, note;
+			double stored{}, avail{};
+		};
+		std::map<string, Pool> pools; // by pool id
+		double used = 0, total = 0, health = -1;
+		int osds = 0, osds_up = 0;
+		const auto now = time_ms();
+		for_each_metric(text, [&](string_view name, string_view labels, double val) {
+			const string id{label(labels, "pool_id")};
+			if (name == "ceph_cluster_total_used_bytes") used = val;
+			else if (name == "ceph_cluster_total_bytes") total = val;
+			else if (name == "ceph_health_status") health = val;
+			else if (name == "ceph_osd_up") osds++, osds_up += val > 0;
+			else if (name == "ceph_pool_metadata") {
+				pools[id].name = label(labels, "name");
+				pools[id].note = label(labels, "description");
+			}
+			else if (name == "ceph_pool_stored") pools[id].stored = val;
+			else if (name == "ceph_pool_max_avail") pools[id].avail = val;
+			else if (name == "ceph_pool_rd_bytes") advance(ceph_counters[id + " rd"], val, now);
+			else if (name == "ceph_pool_wr_bytes") advance(ceph_counters[id + " wr"], val, now);
+		});
+		if (total <= 0) return;
+
+		const array<string, 3> healths = {"HEALTH_OK", "HEALTH_WARN", "HEALTH_ERR"};
+		const size_t header = out.size();
+		out.push_back({
+			.name = "ceph",
+			.note = fmt::format("{}/{} osd  {}", osds_up, osds, health >= 0 and health < 3 ? healths[(size_t)health] : "?"),
+			.header = true,
+			.used = (uint64_t)used,
+			.total = (uint64_t)total,
+		});
+		for (const auto& [id, pool] : pools) {
+			const auto rd = (uint64_t)ceph_counters[id + " rd"].rate, wr = (uint64_t)ceph_counters[id + " wr"].rate;
+			out[header].rd += rd;
+			out[header].wr += wr;
+			if (pool.stored < min_pool_bytes) continue;
+			out.push_back({
+				.name = pool.name,
+				.note = pool.note,
+				.used = (uint64_t)pool.stored,
+				.total = (uint64_t)(pool.stored + pool.avail),
+				.rd = rd,
+				.wr = wr,
+			});
+		}
+		std::sort(out.begin() + header + 1, out.end(), [](const auto& a, const auto& b) { return a.used > b.used; });
+	}
+
+	//? Each longhorn-manager reports its own node's disks and the volumes attached there
+	void add_longhorn(const vector<string>& texts, vector<Storage::storage_info>& out) {
+		std::map<string, Storage::storage_info> disks; // by node
+		std::unordered_set<string> volumes, degraded;
+		for (const auto& text : texts) {
+			for_each_metric(text, [&](string_view name, string_view labels, double val) {
+				const string node{label(labels, "node")};
+				if (name == "longhorn_node_storage_usage_bytes") disks[node].used = val;
+				else if (name == "longhorn_node_storage_capacity_bytes") disks[node].total = val;
+				else if (name == "longhorn_volume_read_throughput") disks[node].rd += val;
+				else if (name == "longhorn_volume_write_throughput") disks[node].wr += val;
+				else if (name == "longhorn_volume_capacity_bytes") volumes.emplace(label(labels, "volume"));
+				else if (name == "longhorn_volume_robustness" and val > 0 and is_in(label(labels, "state"), "degraded", "faulted"))
+					degraded.emplace(label(labels, "volume"));
+			});
+		}
+		if (disks.empty()) return;
+
+		const size_t header = out.size();
+		out.push_back({
+			.name = "longhorn",
+			.note = fmt::format("{} vols", volumes.size()) + (degraded.empty() ? "" : fmt::format("  {} degraded", degraded.size())),
+			.header = true,
+		});
+		for (auto& [node, disk] : disks) {
+			out[header].used += disk.used;
+			out[header].total += disk.total;
+			out[header].rd += disk.rd;
+			out[header].wr += disk.wr;
+			disk.name = node;
+			out.push_back(std::move(disk));
+		}
+	}
+
+	vector<Storage::storage_info> fetch_storage() {
+		auto ceph = std::async(std::launch::async, run,
+			string("kubectl get --raw /api/v1/namespaces/rook-ceph/services/http:rook-ceph-mgr:9283/proxy/metrics 2>/dev/null"));
+		vector<std::future<string>> fetches;
+		for (const auto& e : longhorn_managers)
+			fetches.push_back(std::async(std::launch::async, proxy_metrics, e, 9500));
+
+		vector<string> texts;
+		bool ok = not longhorn_managers.empty();
+		for (auto& f : fetches) {
+			texts.push_back(f.get());
+			if (texts.back().empty()) ok = false;
+		}
+		//? Managers get replaced on upgrades and restarts; look them up again when one stops answering
+		if (not ok) longhorn_managers = find_exporters("app=longhorn-manager");
+
+		vector<Storage::storage_info> out;
+		add_ceph(ceph.get(), out);
+		add_longhorn(texts, out);
+		return out;
+	}
+
+	void storage_loop() {
+		while (not Global::quitting) {
+			const auto start = time_ms();
+			auto fresh = fetch_storage();
+			{
+				std::lock_guard lock(storage_mutex);
+				storage = std::move(fresh);
+			}
+			//? Longhorn's throughput gauges and Ceph's counters move every few seconds at best
+			while (not Global::quitting and time_ms() - start < max<uint64_t>(Config::getI("update_ms"), 2000))
 				std::this_thread::sleep_for(std::chrono::milliseconds(20));
 		}
 	}
@@ -406,7 +584,7 @@ namespace Gpu {
 
 	//* The GPU list is fixed at startup, like the core count; a GPU that stops reporting keeps its last values
 	void init() {
-		Cluster::find_exporters();
+		Cluster::exporters = Cluster::find_exporters("app=nvidia-dcgm-exporter");
 		vector<Cluster::GpuSample> samples;
 		Cluster::fetch_gpus(samples);
 		rng::sort(samples, rng::less{}, &Cluster::GpuSample::key);
@@ -539,9 +717,14 @@ namespace Shared {
 
 		Mem::collect();
 
+		//? The storage box is sized from its row count at startup, so the first fetch happens here
+		Cluster::longhorn_managers = Cluster::find_exporters("app=longhorn-manager");
+		Cluster::storage = Cluster::fetch_storage();
+
 		Cluster::scraped = nodes;
 		std::thread(Cluster::scrape_loop).detach();
 		std::thread(Cluster::pods_loop).detach();
+		std::thread(Cluster::storage_loop).detach();
 	}
 } // namespace Shared
 
@@ -868,6 +1051,17 @@ namespace Nodes {
 	}
 } // namespace Nodes
 
+namespace Storage {
+	vector<storage_info> current_rows;
+
+	auto collect(bool no_update) -> vector<storage_info>& {
+		if (Runner::stopping or (no_update and not current_rows.empty())) return current_rows;
+		std::lock_guard lock(Cluster::storage_mutex);
+		current_rows = Cluster::storage;
+		return current_rows;
+	}
+} // namespace Storage
+
 namespace Proc {
 	vector<proc_info> current_procs;
 	string current_sort;
@@ -882,9 +1076,15 @@ namespace Proc {
 	detail_container detailed;
 	static std::unordered_set<size_t> dead_procs;
 
-	//? Pids are synthetic, assigned per pod the first time it's seen
+	//? Pids are synthetic, assigned per pod (and per namespace and workload, for the tree) the first time it's seen
 	std::unordered_map<string, size_t> pod_pids;
 	size_t next_pod_pid = 1000;
+
+	size_t pid_of(const string& key) {
+		auto [it, added] = pod_pids.try_emplace(key, next_pod_pid);
+		if (added) next_pod_pid++;
+		return it->second;
+	}
 
 	string get_status(char s) {
 		switch (s) {
@@ -988,13 +1188,36 @@ namespace Proc {
 				return &*find_old;
 			};
 
+			//? The tree is namespace › workload › pod; a workload with one pod is left out, since the pod's name already says it
+			std::unordered_map<string, size_t> workload_pods;
+			if (tree) {
+				for (const auto& pod : pods)
+					if (not pod.workload.empty()) workload_pods[fmt::format("{}/{}/{}", pod.ns, pod.kind, pod.workload)]++;
+			}
+
+			struct Group {
+				string name, cmd, ns, parent; // parent: pid key, empty for a namespace
+				time_t start{};
+			};
+			std::unordered_map<string, Group> groups; // by pid key
+
 			for (const auto& pod : pods) {
-				auto [it, added] = pod_pids.try_emplace(pod.ns + "/" + pod.name, next_pod_pid);
-				if (added) next_pod_pid++;
-				if (auto* p = entry(it->second)) {
+				string parent;
+				if (tree) {
+					parent = "ns:" + pod.ns;
+					auto& ns = groups[parent];
+					ns = {pod.ns, "", pod.ns, "", ns.start == 0 ? pod.start : min(ns.start, pod.start)};
+					const string workload = fmt::format("{}/{}/{}", pod.ns, pod.kind, pod.workload);
+					if (workload_pods[workload] > 1) {
+						auto& group = groups["wl:" + workload];
+						group = {pod.workload, pod.kind, pod.ns, parent, group.start == 0 ? pod.start : min(group.start, pod.start)};
+						parent = "wl:" + workload;
+					}
+				}
+				if (auto* p = entry(pid_of(pod.ns + "/" + pod.name))) {
 					p->name = pod.name;
-					//? The command column starts with a 14-wide node column (see Proc::draw's header)
-					p->cmd = fmt::format("{:<14}{}", pod.node.substr(0, 13), pod.images);
+					//? The command column starts with a 14-wide node column (see Proc::draw's header); the tree shows it in parentheses
+					p->cmd = tree ? pod.node + " " + pod.images : fmt::format("{:<14}{}", pod.node.substr(0, 13), pod.images);
 					p->user = pod.ns;
 					p->threads = pod.containers;
 					p->mem = pod.mem;
@@ -1002,7 +1225,22 @@ namespace Proc {
 					p->cpu_c = p->cpu_p;
 					p->state = pod.phase == "Running" ? 'R' : 'P';
 					p->cpu_s = pod.start * 1'000'000;
-					p->ppid = 0;
+					p->ppid = tree ? pid_of(parent) : 0;
+				}
+			}
+
+			//? Namespace and workload rows have no usage of their own; the tree adds up their pods'
+			for (const auto& [key, group] : groups) {
+				if (auto* p = entry(pid_of(key))) {
+					p->name = group.name;
+					p->cmd = group.cmd;
+					p->user = group.ns;
+					p->threads = 0;
+					p->mem = 0;
+					p->cpu_p = p->cpu_c = 0;
+					p->state = 'R';
+					p->cpu_s = group.start * 1'000'000;
+					p->ppid = group.parent.empty() ? 0 : pid_of(group.parent);
 				}
 			}
 

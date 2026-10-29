@@ -1641,6 +1641,46 @@ namespace Nodes {
 		return out + Fx::reset;
 	}
 }
+
+namespace Storage {
+	int x = 1, y, width, height;
+	bool shown = true, redraw = true;
+	string box;
+
+	string draw(const vector<storage_info>& rows, bool force_redraw, bool) {
+		if (Runner::stopping or height < 3) return "";
+		if (force_redraw) redraw = true;
+		string out;
+		out.reserve(width * height);
+		if (redraw) out = box;
+
+		//? name, usage meter + %, used/total, read/write, note; the meter takes whatever width is left
+		int name_w = 10;
+		for (const auto& row : rows) name_w = max(name_w, (int)ulen(row.name) + 1);
+		name_w = min(name_w, 34);
+		const int note_w = 22, rest_w = 6 + 16 + 22 + 1 + note_w;
+		Draw::Meter meter{max(4, width - 2 - name_w - rest_w), "used"};
+
+		for (int row = 0; row < height - 2; row++) {
+			out += Mv::to(y + 1 + row, x + 1);
+			if (row >= (int)rows.size()) {
+				out += string(width - 2, ' ');
+				continue;
+			}
+			const auto& r = rows[row];
+			const long long pct = r.total > 0 ? round((double)r.used * 100 / r.total) : 0;
+			out += (r.header ? Theme::c("title") + Fx::b : Theme::c("main_fg")) + ljust(r.name, name_w - 1, true) + Fx::ub + ' '
+				+ meter(pct) + Theme::g("used").at(clamp(pct, 0ll, 100ll)) + rjust(to_string(pct), 4) + Theme::c("main_fg") + "% "
+				+ rjust(floating_humanizer(r.used, true) + "/" + floating_humanizer(r.total, true), 15)
+				+ " ▼" + rjust(floating_humanizer(r.rd, true, 0, false, true), 9)
+				+ " ▲" + rjust(floating_humanizer(r.wr, true, 0, false, true), 9)
+				+ Theme::c("inactive_fg") + "  " + ljust(r.note, note_w, true);
+		}
+
+		redraw = false;
+		return out + Fx::reset;
+	}
+}
 #endif
 
 namespace Proc {
@@ -2362,6 +2402,10 @@ namespace Draw {
 		Nodes::height = 0;
 		Nodes::redraw = true;
 		Nodes::shown = boxes.contains("node");
+		Storage::box.clear();
+		Storage::height = 0;
+		Storage::redraw = true;
+		Storage::shown = boxes.contains("storage");
 	#endif
 
 		//* Calculate and draw cpu box outlines
@@ -2473,7 +2517,7 @@ namespace Draw {
 				x_vec[i] = 1; y_vec[i] = 1 + total_height + (not Config::getB("cpu_bottom"))*Cpu::shown*Cpu::height;
 				box[i] = createBox(x_vec[i], y_vec[i], width, height, Theme::c("cpu_box"), true, std::string("gpu") + (char)(shown_panels[i]+'0'), "",
 				#ifdef CTOP_CLUSTER
-					(shown_panels[i]+6)%10); // TODO gpu_box
+					(shown_panels[i]+7)%10); // TODO gpu_box
 				#else
 					(shown_panels[i]+5)%10); // TODO gpu_box
 				#endif
@@ -2611,7 +2655,7 @@ namespace Draw {
 			y = (cpu_bottom and Cpu::shown) ? 1 : Cpu::height + 1;
 		#endif
 		#ifdef CTOP_CLUSTER
-			//? The nodes box sits at the top of the proc column, leaving the pod list at least 8 rows
+			//? The nodes and storage boxes stack at the top of the proc column, leaving the pod list at least 8 rows
 			if (Nodes::shown) {
 				Nodes::x = x;
 				Nodes::y = y;
@@ -2621,6 +2665,17 @@ namespace Draw {
 					Nodes::box = createBox(Nodes::x, Nodes::y, Nodes::width, Nodes::height, Theme::c("cpu_box"), true, "nodes", "", 5);
 					y += Nodes::height;
 					height -= Nodes::height;
+				}
+			}
+			if (Storage::shown) {
+				Storage::x = x;
+				Storage::y = y;
+				Storage::width = width;
+				Storage::height = clamp((int)Storage::collect(true).size() + 2, 0, max(0, height - 8));
+				if (Storage::height >= 3) {
+					Storage::box = createBox(Storage::x, Storage::y, Storage::width, Storage::height, Theme::c("mem_box"), true, "storage", "", 6);
+					y += Storage::height;
+					height -= Storage::height;
 				}
 			}
 		#endif

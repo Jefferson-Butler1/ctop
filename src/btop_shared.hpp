@@ -381,6 +381,23 @@ namespace Nodes {
 	auto collect(bool no_update = false) -> vector<node_info>&;
 	string draw(const vector<node_info>& nodes, bool force_redraw = false, bool data_same = false);
 }
+
+//* Cluster storage backends (Ceph, Longhorn), drawn in their own box below the nodes
+namespace Storage {
+	extern string box;
+	extern int x, y, width, height;
+	extern bool shown, redraw;
+
+	//? A header row holds a backend's totals, the rows after it its pools or disks
+	struct storage_info {
+		string name, note;
+		bool header{};
+		uint64_t used{}, total{}, rd{}, wr{}; // bytes, bytes/s
+	};
+
+	auto collect(bool no_update = false) -> vector<storage_info>&;
+	string draw(const vector<storage_info>& rows, bool force_redraw = false, bool data_same = false);
+}
 #endif
 
 namespace Proc {
