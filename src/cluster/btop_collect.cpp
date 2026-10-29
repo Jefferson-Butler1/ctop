@@ -19,7 +19,7 @@ tab-size = 4
 //* ctop cluster backend: the same collectors as the per-OS backends, fed from every node's node-exporter
 //* and the Kubernetes API instead of the local machine. The cluster reads as one big machine: all cores
 //* appended, memory summed, one disk per node filesystem, one net "interface" per node plus a cluster
-//* total, and pods in place of processes (grouped under their node in tree mode).
+//* total, a box of nodes, every node's NVIDIA GPUs (from dcgm-exporter) and pods in place of processes.
 
 #include <chrono>
 #include <cmath>
@@ -312,6 +312,79 @@ namespace Cluster {
 			for (int i = 0; i < 20 and not Global::quitting; i++) std::this_thread::sleep_for(std::chrono::milliseconds(250));
 		}
 	}
+
+	//* One GPU as reported by dcgm-exporter; values in DCGM's units (%, MHz, W, C, MiB)
+	struct GpuSample {
+		string key, name; // key: "node/gpu index"
+		std::unordered_map<string, double> fields; // DCGM_FI_DEV_<field>
+	};
+
+	//? dcgm-exporter pods aren't reachable from outside the cluster, so they're read through the API server proxy
+	struct Exporter {
+		string ns, pod, node;
+	};
+
+	vector<Exporter> exporters;
+	std::mutex gpus_mutex;
+	vector<GpuSample> gpu_samples;
+
+	void find_exporters() {
+		exporters.clear();
+		std::istringstream list(run("kubectl get pods -A -l app=nvidia-dcgm-exporter --no-headers "
+			"-o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName 2>/dev/null"));
+		for (string line; std::getline(list, line);) {
+			std::istringstream fields(line);
+			Exporter e;
+			if (fields >> e.ns >> e.pod >> e.node) exporters.push_back(std::move(e));
+		}
+	}
+
+	//* Fetch every exporter in parallel; false if any of them failed
+	bool fetch_gpus(vector<GpuSample>& out) {
+		vector<std::future<string>> fetches;
+		for (const auto& e : exporters)
+			fetches.push_back(std::async(std::launch::async, run,
+				fmt::format("kubectl get --raw /api/v1/namespaces/{}/pods/{}:9400/proxy/metrics 2>/dev/null", e.ns, e.pod)));
+
+		bool ok = true;
+		for (size_t i = 0; i < exporters.size(); i++) {
+			const string text = fetches[i].get();
+			if (text.empty()) ok = false;
+			std::istringstream lines(text);
+			for (string line; std::getline(lines, line);) {
+				if (not line.starts_with("DCGM_FI_DEV_")) continue;
+				const auto space = line.rfind(' '), brace = line.find('{');
+				if (space == string::npos or brace == string::npos) continue;
+				const string_view labels = string_view(line).substr(brace, space - brace);
+				const string key = exporters[i].node + "/" + string(label(labels, "gpu"));
+				auto gpu = rng::find(out, key, &GpuSample::key);
+				if (gpu == out.end()) {
+					string model{label(labels, "modelName")};
+					for (const auto& brand : {"NVIDIA ", "GeForce "}) model = s_replace(model, brand, "");
+					out.push_back({key, fmt::format("{} {}", exporters[i].node, model), {}});
+					gpu = out.end() - 1;
+				}
+				gpu->fields[line.substr(12, brace - 12)] = std::strtod(line.c_str() + space + 1, nullptr);
+			}
+		}
+		return ok;
+	}
+
+	void gpus_loop() {
+		while (not Global::quitting) {
+			const auto start = time_ms();
+			vector<GpuSample> fresh;
+			//? Exporter pods get replaced on upgrades and restarts; look them up again when one stops answering
+			if (not fetch_gpus(fresh)) find_exporters();
+			{
+				std::lock_guard lock(gpus_mutex);
+				gpu_samples = std::move(fresh);
+			}
+			//? dcgm-exporter samples at most once a second, so polling faster only spawns kubectl for repeats
+			while (not Global::quitting and time_ms() - start < max<uint64_t>(Config::getI("update_ms"), 1000))
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		}
+	}
 } // namespace Cluster
 
 using Cluster::nodes;
@@ -319,6 +392,99 @@ using Cluster::nodes;
 namespace Cpu {
 	extern cpu_info current_cpu;
 }
+
+namespace Gpu {
+	vector<gpu_info> gpus;
+
+	//? clean_quit() shuts down the local GPU libraries; the cluster backend has none
+	namespace Nvml { bool shutdown() { return true; } }
+	namespace Rsmi { bool shutdown() { return true; } }
+	namespace Asysfs { bool shutdown() { return true; } }
+#ifdef __APPLE__
+	namespace AppleSilicon { bool shutdown() { return true; } }
+#endif
+
+	//* The GPU list is fixed at startup, like the core count; a GPU that stops reporting keeps its last values
+	void init() {
+		Cluster::find_exporters();
+		vector<Cluster::GpuSample> samples;
+		Cluster::fetch_gpus(samples);
+		rng::sort(samples, rng::less{}, &Cluster::GpuSample::key);
+		for (const auto& sample : samples) {
+			gpu_info gpu;
+			gpu.supported_functions.pcie_txrx = false;
+			gpu.supported_functions.pwr_state = false;
+			gpus.push_back(std::move(gpu));
+			gpu_names.push_back(sample.name);
+			gpu_pwr_total_max += gpus.back().pwr_max_usage;
+		}
+		{
+			std::lock_guard lock(Cluster::gpus_mutex);
+			Cluster::gpu_samples = std::move(samples);
+		}
+		count = gpus.size();
+		if (count > 0) std::thread(Cluster::gpus_loop).detach();
+	}
+
+	auto collect(bool no_update) -> vector<gpu_info>& {
+		if (Runner::stopping or (no_update and not gpus.empty()) or gpus.empty()) return gpus;
+
+		vector<Cluster::GpuSample> samples;
+		{
+			std::lock_guard lock(Cluster::gpus_mutex);
+			samples = Cluster::gpu_samples;
+		}
+
+		long long avg = 0, mem_usage_total = 0, mem_total = 0, pwr_total = 0;
+		for (size_t i = 0; i < gpus.size(); i++) {
+			auto& gpu = gpus[i];
+			if (auto it = rng::find(samples, gpu_names[i], &Cluster::GpuSample::name); it != samples.end()) {
+				auto get = [&](const string& field) { auto f = it->fields.find(field); return f == it->fields.end() ? 0.0 : f->second; };
+				gpu.gpu_percent.at("gpu-totals").push_back(round(get("GPU_UTIL")));
+				gpu.mem_utilization_percent.push_back(round(get("MEM_COPY_UTIL")));
+				gpu.gpu_clock_speed = get("SM_CLOCK");
+				gpu.mem_clock_speed = get("MEM_CLOCK");
+				gpu.pwr_usage = round(get("POWER_USAGE") * 1000); // W -> mW
+				if (gpu.pwr_usage > gpu.pwr_max_usage) gpu.pwr_max_usage = gpu.pwr_usage;
+				gpu.gpu_percent.at("gpu-pwr-totals").push_back(clamp((long long)round((double)gpu.pwr_usage * 100 / gpu.pwr_max_usage), 0ll, 100ll));
+				gpu.temp.push_back(round(get("GPU_TEMP")));
+				gpu.mem_used = get("FB_USED") * 1048576;
+				gpu.mem_total = (get("FB_USED") + get("FB_FREE") + get("FB_RESERVED")) * 1048576;
+				if (gpu.mem_total > 0) gpu.gpu_percent.at("gpu-vram-totals").push_back(round((double)gpu.mem_used * 100 / gpu.mem_total));
+				gpu.encoder_utilization = round(get("ENC_UTIL"));
+				gpu.decoder_utilization = round(get("DEC_UTIL"));
+			}
+
+			if (not gpu.gpu_percent.at("gpu-totals").empty()) avg += gpu.gpu_percent.at("gpu-totals").back();
+			mem_usage_total += gpu.mem_used;
+			mem_total += gpu.mem_total;
+			pwr_total += gpu.pwr_usage;
+
+			//* Trim vectors if there are more values than needed for graphs
+			if (width != 0) {
+				while (cmp_greater(gpu.gpu_percent.at("gpu-totals").size(), width * 2)) gpu.gpu_percent.at("gpu-totals").pop_front();
+				while (cmp_greater(gpu.mem_utilization_percent.size(), width)) gpu.mem_utilization_percent.pop_front();
+				while (cmp_greater(gpu.gpu_percent.at("gpu-pwr-totals").size(), width)) gpu.gpu_percent.at("gpu-pwr-totals").pop_front();
+				while (cmp_greater(gpu.temp.size(), 18)) gpu.temp.pop_front();
+				while (cmp_greater(gpu.gpu_percent.at("gpu-vram-totals").size(), width/2)) gpu.gpu_percent.at("gpu-vram-totals").pop_front();
+			}
+		}
+
+		shared_gpu_percent.at("gpu-average").push_back(avg / (long long)gpus.size());
+		if (mem_total != 0)
+			shared_gpu_percent.at("gpu-vram-total").push_back(round(mem_usage_total * 100.0 / mem_total));
+		if (gpu_pwr_total_max != 0)
+			shared_gpu_percent.at("gpu-pwr-total").push_back(clamp((long long)round(pwr_total * 100.0 / gpu_pwr_total_max), 0ll, 100ll));
+
+		if (width != 0) {
+			while (cmp_greater(shared_gpu_percent.at("gpu-average").size(), width * 2)) shared_gpu_percent.at("gpu-average").pop_front();
+			while (cmp_greater(shared_gpu_percent.at("gpu-pwr-total").size(), width * 2)) shared_gpu_percent.at("gpu-pwr-total").pop_front();
+			while (cmp_greater(shared_gpu_percent.at("gpu-vram-total").size(), width * 2)) shared_gpu_percent.at("gpu-vram-total").pop_front();
+		}
+
+		return gpus;
+	}
+} // namespace Gpu
 
 namespace Shared {
 	uint64_t totalMem;
@@ -353,6 +519,23 @@ namespace Shared {
 			if (not vec.empty() and not v_contains(Cpu::available_fields, field)) Cpu::available_fields.push_back(field);
 		}
 		Cpu::cpuName = fmt::format("Cluster: {} nodes", nodes.size());
+
+		Gpu::init();
+		if (not Gpu::gpu_names.empty()) {
+			for (auto const& [key, _] : Gpu::gpus[0].gpu_percent)
+				Cpu::available_fields.push_back(key);
+			for (auto const& [key, _] : Gpu::shared_gpu_percent)
+				Cpu::available_fields.push_back(key);
+
+			using namespace Gpu;
+			gpu_b_height_offsets.resize(gpus.size());
+			for (size_t i = 0; i < gpu_b_height_offsets.size(); ++i)
+				gpu_b_height_offsets[i] = gpus[i].supported_functions.gpu_utilization
+					+ gpus[i].supported_functions.pwr_usage
+					+ (gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization)
+					+ (gpus[i].supported_functions.mem_total or gpus[i].supported_functions.mem_used)
+						* (1 + 2*(gpus[i].supported_functions.mem_total and gpus[i].supported_functions.mem_used) + 2*gpus[i].supported_functions.mem_utilization);
+		}
 
 		Mem::collect();
 
@@ -651,6 +834,40 @@ namespace Net {
 	}
 } // namespace Net
 
+namespace Nodes {
+	vector<node_info> current_nodes;
+
+	auto collect(bool no_update) -> vector<node_info>& {
+		if (Runner::stopping or (no_update and not current_nodes.empty())) return current_nodes;
+		Cluster::refresh();
+
+		std::unordered_map<string, size_t> pods;
+		{
+			std::lock_guard lock(Cluster::pods_mutex);
+			for (const auto& pod : Cluster::pods) pods[pod.node]++;
+		}
+
+		current_nodes.clear();
+		for (const auto& node : nodes) {
+			auto get = [&](const string& key) { auto it = node.cur.mem.find(key); return it == node.cur.mem.end() ? 0.0 : it->second; };
+			current_nodes.push_back({
+				.name = node.name,
+				.addr = node.addr,
+				.up = node.up,
+				.cores = node.cores,
+				.pods = pods[node.name],
+				.cpu = (long long)round(Cluster::busy(node, 0, node.cores) * 100),
+				.mem_used = (uint64_t)(get("MemTotal") - get("MemAvailable")),
+				.mem_total = (uint64_t)get("MemTotal"),
+				.rx = (uint64_t)Cluster::rate(node, node.cur.rx, node.prev.rx),
+				.tx = (uint64_t)Cluster::rate(node, node.cur.tx, node.prev.tx),
+				.load = node.cur.load[0],
+			});
+		}
+		return current_nodes;
+	}
+} // namespace Nodes
+
 namespace Proc {
 	vector<proc_info> current_procs;
 	string current_sort;
@@ -665,7 +882,7 @@ namespace Proc {
 	detail_container detailed;
 	static std::unordered_set<size_t> dead_procs;
 
-	//? Pids are synthetic: nodes are 1..N so pods can name their node as parent, pods count up from 1000
+	//? Pids are synthetic, assigned per pod the first time it's seen
 	std::unordered_map<string, size_t> pod_pids;
 	size_t next_pod_pid = 1000;
 
@@ -673,12 +890,11 @@ namespace Proc {
 		switch (s) {
 			case 'R': return "Running";
 			case 'P': return "Pending";
-			case 'D': return "Down";
 			default: return "Unknown";
 		}
 	}
 
-	//* Get detailed info for selected pod or node
+	//* Get detailed info for selected pod
 	void _collect_details(const size_t pid, vector<proc_info>& procs) {
 		if (pid != detailed.last_pid) {
 			detailed = {};
@@ -717,7 +933,7 @@ namespace Proc {
 		while (cmp_greater(detailed.mem_bytes.size(), width)) detailed.mem_bytes.pop_front();
 	}
 
-	//* Collects and sorts pods (and their nodes) as processes
+	//* Collects and sorts pods as processes
 	auto collect(bool no_update) -> vector<proc_info>& {
 		const auto& sorting = Config::getS("proc_sorting");
 		auto reverse = Config::getB("proc_reversed");
@@ -749,8 +965,6 @@ namespace Proc {
 			//* ---------------------------------------------Collection start----------------------------------------------
 			should_filter = true;
 			found.clear();
-			Cluster::refresh();
-
 			vector<Cluster::Pod> pods;
 			{
 				std::lock_guard lock(Cluster::pods_mutex);
@@ -774,33 +988,13 @@ namespace Proc {
 				return &*find_old;
 			};
 
-			std::unordered_map<string, size_t> node_pid, node_pods;
-			for (const auto& pod : pods) node_pods[pod.node]++;
-
-			for (size_t i = 0; i < nodes.size(); i++) {
-				const auto& node = nodes[i];
-				node_pid[node.name] = i + 1;
-				if (auto* p = entry(i + 1)) {
-					auto get = [&](const string& key) { auto it = node.cur.mem.find(key); return it == node.cur.mem.end() ? 0.0 : it->second; };
-					p->name = node.name;
-					p->cmd = fmt::format("node {} ({} cores)", node.addr, node.cores);
-					p->user = "node";
-					p->threads = node_pods[node.name];
-					p->mem = get("MemTotal") - get("MemAvailable");
-					p->cpu_p = Cluster::busy(node, 0, node.cores) * node.cores * scale;
-					p->cpu_c = p->cpu_p;
-					p->state = node.up ? 'R' : 'D';
-					p->cpu_s = node.cur.boot * 1'000'000;
-					p->ppid = 0;
-				}
-			}
-
 			for (const auto& pod : pods) {
 				auto [it, added] = pod_pids.try_emplace(pod.ns + "/" + pod.name, next_pod_pid);
 				if (added) next_pod_pid++;
 				if (auto* p = entry(it->second)) {
 					p->name = pod.name;
-					p->cmd = pod.images;
+					//? The command column starts with a 14-wide node column (see Proc::draw's header)
+					p->cmd = fmt::format("{:<14}{}", pod.node.substr(0, 13), pod.images);
 					p->user = pod.ns;
 					p->threads = pod.containers;
 					p->mem = pod.mem;
@@ -808,7 +1002,7 @@ namespace Proc {
 					p->cpu_c = p->cpu_p;
 					p->state = pod.phase == "Running" ? 'R' : 'P';
 					p->cpu_s = pod.start * 1'000'000;
-					p->ppid = node_pid.contains(pod.node) ? node_pid.at(pod.node) : 0;
+					p->ppid = 0;
 				}
 			}
 

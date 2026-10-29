@@ -1603,6 +1603,46 @@ namespace Net {
 
 }
 
+#ifdef CTOP_CLUSTER
+namespace Nodes {
+	int x = 1, y, width, height;
+	bool shown = true, redraw = true;
+	string box;
+
+	string draw(const vector<node_info>& nodes, bool force_redraw, bool) {
+		if (Runner::stopping or height < 3) return "";
+		if (force_redraw) redraw = true;
+		string out;
+		out.reserve(width * height);
+		if (redraw) out = box;
+
+		//? name, cpu meter + %, mem meter + %, net, pods, load; meters take whatever width is left
+		const int name_w = 14, rest_w = 5 + 6 + 22 + 10 + 10;
+		const int meter_w = max(4, (width - 2 - name_w - rest_w) / 2);
+		Draw::Meter cpu_meter{meter_w, "cpu"}, mem_meter{meter_w, "used"};
+
+		for (int row = 0; const auto& node : nodes) {
+			if (row >= height - 2) break;
+			out += Mv::to(y + 1 + row++, x + 1) + Theme::c("title") + Fx::b + ljust(node.name, name_w, true) + Fx::ub;
+			if (not node.up) {
+				out += Theme::c("inactive_fg") + ljust("down", width - 2 - name_w);
+				continue;
+			}
+			const long long mem_pct = node.mem_total > 0 ? round((double)node.mem_used * 100 / node.mem_total) : 0;
+			out += cpu_meter(node.cpu) + Theme::g("cpu").at(clamp(node.cpu, 0ll, 100ll)) + rjust(to_string(node.cpu), 4) + Theme::c("main_fg") + "% "
+				+ mem_meter(mem_pct) + Theme::g("used").at(clamp(mem_pct, 0ll, 100ll)) + rjust(to_string(mem_pct), 4) + Theme::c("main_fg") + "% "
+				+ Theme::c("main_fg") + " ▼" + rjust(floating_humanizer(node.rx, true, 0, false, true), 9)
+				+ " ▲" + rjust(floating_humanizer(node.tx, true, 0, false, true), 9)
+				+ rjust(to_string(node.pods), 5) + Theme::c("inactive_fg") + " pods"
+				+ Theme::c("main_fg") + rjust(fmt::format("{:.1f}", node.load), 6) + Theme::c("inactive_fg") + " ld";
+		}
+
+		redraw = false;
+		return out + Fx::reset;
+	}
+}
+#endif
+
 namespace Proc {
 	int width_p = 55, height_p = 68;
 	int min_width = 44, min_height = 16;
@@ -1991,13 +2031,21 @@ namespace Proc {
 				out += Mv::to(y+1, x+1) + Theme::c("title") + Fx::b
 					+ rjust("Pid:", 8) + ' '
 					+ ljust("Program:", prog_size) + ' '
+#ifdef CTOP_CLUSTER
+					+ (cmd_size > 0 ? ljust(ljust("Node:", 14) + "Images:", cmd_size) : "") + ' ';
+#else
 					+ (cmd_size > 0 ? ljust("Command:", cmd_size) : "") + ' ';
+#endif
 			else
 				out += Mv::to(y+1, x+1) + Theme::c("title") + Fx::b
 					+ ljust("Tree:", tree_size) + ' ';
 
 			out += (thread_size > 0 ? Mv::l(4) + "Threads: " : "")
+#ifdef CTOP_CLUSTER
+					+ ljust("Namespace:", user_size) + ' '
+#else
 					+ ljust("User:", user_size) + ' '
+#endif
 					+ rjust((mem_bytes ? "MemB" : "Mem%"), 5) + ' '
 					+ rjust("Cpu%", (show_graphs ? 10 : 5)) + Fx::ub;
 		}
@@ -2309,6 +2357,12 @@ namespace Draw {
 		Mem::shown = boxes.contains("mem");
 		Net::shown = boxes.contains("net");
 		Proc::shown = boxes.contains("proc");
+	#ifdef CTOP_CLUSTER
+		Nodes::box.clear();
+		Nodes::height = 0;
+		Nodes::redraw = true;
+		Nodes::shown = boxes.contains("node");
+	#endif
 
 		//* Calculate and draw cpu box outlines
 		if (Cpu::shown) {
@@ -2550,6 +2604,20 @@ namespace Draw {
 			y = ((cpu_bottom and Cpu::shown) ? 1 : Cpu::height + 1) + Gpu::total_height;
 		#else
 			y = (cpu_bottom and Cpu::shown) ? 1 : Cpu::height + 1;
+		#endif
+		#ifdef CTOP_CLUSTER
+			//? The nodes box sits at the top of the proc column, leaving the pod list at least 8 rows
+			if (Nodes::shown) {
+				Nodes::x = x;
+				Nodes::y = y;
+				Nodes::width = width;
+				Nodes::height = clamp((int)Nodes::collect(true).size() + 2, 0, max(0, height - 8));
+				if (Nodes::height >= 3) {
+					Nodes::box = createBox(Nodes::x, Nodes::y, Nodes::width, Nodes::height, Theme::c("cpu_box"), true, "nodes");
+					y += Nodes::height;
+					height -= Nodes::height;
+				}
+			}
 		#endif
 			select_max = height - 3;
 			box = createBox(x, y, width, height, Theme::c("proc_box"), true, "proc", "", 4);

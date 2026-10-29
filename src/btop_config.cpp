@@ -51,6 +51,9 @@ const vector<string> Config::valid_graph_symbols = { "braille", "block", "tty" }
 const vector<string> Config::valid_graph_symbols_def = { "default", "braille", "block", "tty" };
 const vector<string> Config::valid_boxes = {
 	"cpu", "mem", "net", "proc"
+#ifdef CTOP_CLUSTER
+	,"node"
+#endif
 #ifdef GPU_SUPPORT
 	,"gpu0", "gpu1", "gpu2", "gpu3", "gpu4", "gpu5"
 #endif
@@ -125,7 +128,7 @@ namespace Config {
 
 		{"graph_symbol_proc", 	"# Graph symbol to use for graphs in cpu box, \"default\", \"braille\", \"block\" or \"tty\"."},
 
-		{"shown_boxes", 		"#* Manually set which boxes to show. Available values are \"cpu mem net proc\" and \"gpu0\" through \"gpu5\", separate values with whitespace."},
+		{"shown_boxes", 		"#* Manually set which boxes to show. Available values are \"cpu mem net proc\" (plus \"node\" in ctop) and \"gpu0\" through \"gpu5\", separate values with whitespace."},
 
 		{"update_ms", 			"#* Update time in milliseconds, recommended 2000 ms or above for better sample times for graphs."},
 
@@ -279,7 +282,11 @@ namespace Config {
 
 	std::unordered_map<std::string_view, string> strings = {
 		{"color_theme", "Default"},
+#ifdef CTOP_CLUSTER
+		{"shown_boxes", "cpu mem net proc node gpu0 gpu1 gpu2 gpu3 gpu4 gpu5"},
+#else
 		{"shown_boxes", "cpu mem net proc"},
+#endif
 		{"graph_symbol", "braille"},
 		{"disable_presets", "Off"},
 		{"presets", "cpu:1:default,proc:0:default cpu:0:default,mem:0:default,net:0:default cpu:0:block,net:0:tty"},
@@ -730,6 +737,15 @@ namespace Config {
 
 	bool set_boxes(const string& boxes) {
 		auto new_boxes = ssplit(boxes);
+	#ifdef CTOP_CLUSTER
+		//? The cluster's GPU count isn't known until it's queried, so GPU boxes it doesn't have are dropped rather than rejected
+		//? and the trimmed list is saved so size checks that read shown_boxes don't count them
+		if (std::erase_if(new_boxes, [](const string& box) { return box.starts_with("gpu") and stoi(box.substr(3)) + 1 > Gpu::count; }) > 0) {
+			string trimmed;
+			for (const auto& box : new_boxes) trimmed += (trimmed.empty() ? "" : " ") + box;
+			set("shown_boxes", trimmed);
+		}
+	#endif
 		for (auto& box : new_boxes) {
 			if (not v_contains(valid_boxes, box)) return false;
 		#ifdef GPU_SUPPORT

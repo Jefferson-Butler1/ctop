@@ -362,6 +362,27 @@ namespace Net {
 	string draw(const net_info& net, bool force_redraw = false, bool data_same = false);
 }
 
+#ifdef CTOP_CLUSTER
+//* Cluster nodes, drawn in their own box above the pod list
+namespace Nodes {
+	extern string box;
+	extern int x, y, width, height;
+	extern bool shown, redraw;
+
+	struct node_info {
+		string name, addr;
+		bool up{};
+		size_t cores{}, pods{};
+		long long cpu{}; // percent
+		uint64_t mem_used{}, mem_total{}, rx{}, tx{}; // bytes, bytes/s
+		double load{};
+	};
+
+	auto collect(bool no_update = false) -> vector<node_info>&;
+	string draw(const vector<node_info>& nodes, bool force_redraw = false, bool data_same = false);
+}
+#endif
+
 namespace Proc {
 	extern atomic<int> numpids;
 

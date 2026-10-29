@@ -623,6 +623,19 @@ namespace Runner {
 					}
 				}
 
+			#ifdef CTOP_CLUSTER
+				//? NODES
+				if (v_contains(conf.boxes, "node") and v_contains(conf.boxes, "proc")) {
+					try {
+						auto nodes = Nodes::collect(conf.no_update);
+						if (not pause_output) output += Nodes::draw(nodes, conf.force_redraw, conf.no_update);
+					}
+					catch (const std::exception& e) {
+						throw std::runtime_error("Nodes:: -> " + string{e.what()});
+					}
+				}
+			#endif
+
 				//? PROC
 				if (v_contains(conf.boxes, "proc")) {
 					try {

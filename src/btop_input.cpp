@@ -217,7 +217,7 @@ namespace Input {
 			auto filtering = Config::getB("proc_filtering");
 			auto vim_keys = Config::getB("vim_keys");
 			auto help_key = (vim_keys ? "H" : "h");
-			auto kill_key = (vim_keys ? "K" : "k");
+			[[maybe_unused]] auto kill_key = (vim_keys ? "K" : "k");
 			//? Global input actions
 			if (not filtering) {
 				bool keep_going = false;

@@ -72,7 +72,7 @@ endif()
 
 if(CTOP_CLUSTER)
   target_sources(libbtop PRIVATE src/cluster/btop_collect.cpp)
-  target_compile_definitions(libbtop PUBLIC CTOP_CLUSTER)
+  target_compile_definitions(libbtop PUBLIC CTOP_CLUSTER GPU_SUPPORT)
   set_target_properties(btop PROPERTIES OUTPUT_NAME ctop)
 elseif(APPLE)
   target_sources(libbtop PRIVATE src/osx/btop_collect.cpp src/osx/sensors.cpp src/osx/smc.cpp)

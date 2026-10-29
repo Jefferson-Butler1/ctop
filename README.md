@@ -5,7 +5,9 @@ btop for a whole Kubernetes cluster. A fork of btop with one extra collector bac
 * **cpu**: every node's cores appended, labelled by node initial (`p12` = core 12 on the node starting with `p`)
 * **mem**: memory summed across nodes; one disk per node filesystem (`node:/mount`)
 * **net**: one interface per node plus `cluster` (all of them); cycle with `b`/`n`
-* **proc**: pods as processes (namespace as user, images as command); tree mode (`e`) groups pods under their node
+* **nodes**: one row per node (cpu, memory, network, pod count, load), above the pod list
+* **gpu**: one box per NVIDIA GPU in the cluster, read from the GPU operator's dcgm-exporter through the API server
+* **proc**: pods as processes, with their node and namespace
 
 It's read-only: signal and nice actions are compiled out, since pod pids are synthetic.
 
