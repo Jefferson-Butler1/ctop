@@ -2471,7 +2471,12 @@ namespace Draw {
 				height += (height+Cpu::height == Term::height-1);
 				height = max(height, b_height_vec[i] + 2);
 				x_vec[i] = 1; y_vec[i] = 1 + total_height + (not Config::getB("cpu_bottom"))*Cpu::shown*Cpu::height;
-				box[i] = createBox(x_vec[i], y_vec[i], width, height, Theme::c("cpu_box"), true, std::string("gpu") + (char)(shown_panels[i]+'0'), "", (shown_panels[i]+5)%10); // TODO gpu_box
+				box[i] = createBox(x_vec[i], y_vec[i], width, height, Theme::c("cpu_box"), true, std::string("gpu") + (char)(shown_panels[i]+'0'), "",
+				#ifdef CTOP_CLUSTER
+					(shown_panels[i]+6)%10); // TODO gpu_box
+				#else
+					(shown_panels[i]+5)%10); // TODO gpu_box
+				#endif
 				b_width = clamp(width/2, min_width, 65);
 				total_height += height;
 
@@ -2613,7 +2618,7 @@ namespace Draw {
 				Nodes::width = width;
 				Nodes::height = clamp((int)Nodes::collect(true).size() + 2, 0, max(0, height - 8));
 				if (Nodes::height >= 3) {
-					Nodes::box = createBox(Nodes::x, Nodes::y, Nodes::width, Nodes::height, Theme::c("cpu_box"), true, "nodes");
+					Nodes::box = createBox(Nodes::x, Nodes::y, Nodes::width, Nodes::height, Theme::c("cpu_box"), true, "nodes", "", 5);
 					y += Nodes::height;
 					height -= Nodes::height;
 				}
