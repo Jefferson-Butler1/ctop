@@ -82,14 +82,19 @@ namespace Cluster {
 		string name, addr;
 		size_t cores{};
 		bool up{};
+		int misses{}; // failed scrapes in a row
 		Sample cur, prev;
 	};
 
 	struct Pod {
 		string ns, name, node, phase, images;
 		string kind, workload; // owning workload, empty for bare pods
-		size_t containers{};
-		double cpu{}, mem{}; // cores, bytes
+		string problem; // why the pod isn't running (CrashLoopBackOff, Evicted, ...), empty when it is
+		string last_exit; // why a container last died, e.g. OOMKilled
+		size_t containers{}, ready{}, restarts{};
+		bool host_network{};
+		double cpu{}, mem{}, rx{}, tx{}; // cores, bytes, bytes/s (from the kubelet)
+		double cpu_req{}, mem_req{}, mem_limit{}; // summed over containers; mem_limit is 0 unless every container has one
 		time_t start{};
 	};
 
@@ -98,8 +103,6 @@ namespace Cluster {
 	std::mutex scrape_mutex;
 	bool fresh = false;
 
-	std::mutex pods_mutex;
-	vector<Pod> pods;
 
 	string run(const string& cmd) {
 		string out;
@@ -138,11 +141,15 @@ namespace Cluster {
 
 	Sample parse(string_view text) {
 		Sample s{.at = time_ms()};
+		bool complete = false;
 		while (not text.empty()) {
 			const auto eol = text.find('\n');
 			const auto line = text.substr(0, eol);
 			text = (eol == string_view::npos ? string_view{} : text.substr(eol + 1));
 			if (not line.starts_with("node_")) continue;
+			//? node-exporter sorts its output by name and node_scrape_* follows everything ctop reads, so a response
+			//? cut off by curl's timeout is caught here instead of passing for a node with no memory or network
+			if (line.starts_with("node_scrape_")) complete = true;
 
 			const auto space = line.rfind(' ');
 			if (space == string_view::npos) continue;
@@ -189,7 +196,7 @@ namespace Cluster {
 		std::erase_if(s.fs, [&](const Filesystem& f) { return not seen.insert(f.device).second; });
 		rng::sort(s.fs, rng::less{}, &Filesystem::mount);
 
-		s.ok = not s.cpu.empty();
+		s.ok = complete and not s.cpu.empty();
 		return s;
 	}
 
@@ -207,9 +214,11 @@ namespace Cluster {
 		for (size_t i = 0; i < into.size(); i++) {
 			auto& node = into[i];
 			auto sample = parse(scrapes[i].get());
-			node.up = sample.ok;
+			//? A busy node can miss a scrape now and then; it only counts as down after a few in a row
+			node.misses = sample.ok ? 0 : node.misses + 1;
+			node.up = node.misses < 3 and (sample.ok or node.cur.ok);
 			//? A down node keeps its last sample, so cluster totals don't dip and spike around an outage
-			if (node.up) {
+			if (sample.ok) {
 				node.prev = std::move(node.cur);
 				node.cur = std::move(sample);
 			}
@@ -266,28 +275,77 @@ namespace Cluster {
 	}
 
 	double quantity(string_view q) {
-		for (const auto& [suffix, mult] : {std::pair{"Ki"sv, 1024.0}, {"Mi"sv, 1048576.0}, {"Gi"sv, 1073741824.0}, {"m"sv, 0.001}})
+		for (const auto& [suffix, mult] : {std::pair{"Ki"sv, 1024.0}, {"Mi"sv, 1048576.0}, {"Gi"sv, 1073741824.0}, {"Ti"sv, 1099511627776.0},
+				{"k"sv, 1e3}, {"M"sv, 1e6}, {"G"sv, 1e9}, {"T"sv, 1e12}, {"m"sv, 0.001}, {"n"sv, 1e-9}})
 			if (q.ends_with(suffix)) return std::strtod(string(q.substr(0, q.size() - suffix.size())).c_str(), nullptr) * mult;
 		return std::strtod(string(q).c_str(), nullptr);
 	}
 
+	time_t parse_time(const string& stamp) {
+		std::tm tm{};
+		std::istringstream(stamp) >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
+		return timegm(&tm);
+	}
+
+	//? The Kubernetes fetches go through jq, which turns the API's JSON into tab-separated lines
+	vector<vector<string>> tsv(const string& cmd) {
+		vector<vector<string>> rows;
+		std::istringstream lines(run(cmd));
+		for (string line; std::getline(lines, line);) {
+			auto& row = rows.emplace_back();
+			for (size_t pos = 0;;) {
+				const auto tab = line.find('\t', pos);
+				row.push_back(line.substr(pos, tab - pos));
+				if (tab == string::npos) break;
+				pos = tab + 1;
+			}
+		}
+		return rows;
+	}
+
+	//* Kubernetes-side state of a node, next to node-exporter's view of it
+	struct NodeState {
+		string name, flag; // flag: NotReady, cordoned or a pressure condition, empty when fine
+		double cpu_alloc{}, mem_alloc{}; // cores, bytes
+	};
+
+	struct Pvc {
+		string ns, name;
+		double used{}, capacity{};
+	};
+
+	//? Everything read from the Kubernetes API and kubelets, refreshed together by kube_loop
+	std::mutex kube_mutex;
+	vector<Pod> pods;
+	vector<NodeState> node_states;
+	vector<Pvc> pvcs;
+	vector<Events::event_info> events; // not-ready Flux objects, then Warning events
+	string flux_summary;
+	vector<string> node_names; // set once at startup
+
 	vector<Pod> fetch_pods() {
 		vector<Pod> out;
-		std::unordered_map<string, size_t> index;
-		std::istringstream list(run("kubectl get pods -A --no-headers -o custom-columns="
-			"NS:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,"
-			"START:.status.startTime,KIND:.metadata.ownerReferences[0].kind,OWNER:.metadata.ownerReferences[0].name,"
-			"IMAGES:.spec.containers[*].image 2>/dev/null"));
-		for (string line; std::getline(list, line);) {
-			std::istringstream fields(line);
-			Pod pod;
-			string start;
-			if (not (fields >> pod.ns >> pod.name >> pod.node >> pod.phase >> start >> pod.kind >> pod.workload >> pod.images)) continue;
-			if (is_in(pod.phase, "Succeeded", "Failed")) continue;
+		for (const auto& f : tsv(R"cmd(kubectl get pods -A -o json 2>/dev/null | jq -r '.items[] | select(.status.phase != "Succeeded" and .status.phase != "Failed") | [
+			.metadata.namespace, .metadata.name, (.spec.nodeName // "-"), .status.phase, (.status.startTime // ""),
+			(.metadata.ownerReferences[0].kind // ""), (.metadata.ownerReferences[0].name // ""),
+			([.spec.containers[].image] | join(",")), (.spec.hostNetwork // false),
+			([.status.containerStatuses[]? | select(.ready)] | length), ([.status.containerStatuses[]?.restartCount] | add // 0),
+			(.status.reason // ([.status.containerStatuses[]? | .state.waiting.reason // .state.terminated.reason // empty] | first) // ""),
+			([.status.containerStatuses[]? | .lastState.terminated.reason // empty] | first // ""),
+			([.spec.containers[] | .resources.requests.cpu // "0"] | join(",")), ([.spec.containers[] | .resources.requests.memory // "0"] | join(",")),
+			([.spec.containers[] | .resources.limits.memory // "-"] | join(","))
+			] | @tsv' 2>/dev/null)cmd")) {
+			if (f.size() < 16) continue;
+			Pod pod{.ns = f[0], .name = f[1], .node = f[2], .phase = f[3], .images = f[7], .kind = f[5], .workload = f[6],
+				.problem = f[11], .last_exit = f[12]};
+			pod.start = parse_time(f[4]);
+			pod.host_network = f[8] == "true";
+			pod.containers = rng::count(pod.images, ',') + 1;
+			pod.ready = std::stoul(f[9]);
+			pod.restarts = std::stoul(f[10]);
 			//? Name the workload a person made: a ReplicaSet's Deployment, a scheduled Job's CronJob
 			auto suffix = [&] { return pod.workload.substr(pod.workload.rfind('-') + 1); };
-			if (pod.kind == "<none>") pod.kind = pod.workload = "";
-			else if (pod.kind == "ReplicaSet" and pod.workload.contains('-')) {
+			if (pod.kind == "ReplicaSet" and pod.workload.contains('-')) {
 				pod.kind = "Deployment";
 				pod.workload.resize(pod.workload.rfind('-'));
 			}
@@ -295,34 +353,135 @@ namespace Cluster {
 				pod.kind = "CronJob";
 				pod.workload.resize(pod.workload.rfind('-'));
 			}
-			pod.containers = rng::count(pod.images, ',') + 1;
-			std::tm tm{};
-			std::istringstream(start) >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%SZ");
-			pod.start = timegm(&tm);
-			index[pod.ns + "/" + pod.name] = out.size();
+			for (const auto& q : ssplit(f[13], ',')) pod.cpu_req += quantity(q);
+			for (const auto& q : ssplit(f[14], ',')) pod.mem_req += quantity(q);
+			const auto limits = ssplit(f[15], ',');
+			if (not v_contains(limits, "-"))
+				for (const auto& q : limits) pod.mem_limit += quantity(q);
 			out.push_back(std::move(pod));
-		}
-
-		std::istringstream top(run("kubectl top pods -A --no-headers 2>/dev/null"));
-		for (string line; std::getline(top, line);) {
-			std::istringstream fields(line);
-			string ns, name, cpu, mem;
-			if (not (fields >> ns >> name >> cpu >> mem)) continue;
-			if (auto it = index.find(ns + "/" + name); it != index.end()) {
-				out[it->second].cpu = quantity(cpu);
-				out[it->second].mem = quantity(mem);
-			}
 		}
 		return out;
 	}
 
-	//? metrics-server only refreshes every ~15s and kubectl is slow, so pods are fetched off the runner thread
-	void pods_loop() {
+	vector<NodeState> fetch_node_states() {
+		vector<NodeState> out;
+		for (const auto& f : tsv(R"cmd(kubectl get nodes -o json 2>/dev/null | jq -r '.items[] | [.metadata.name, (.spec.unschedulable // false),
+			([.status.conditions[] | select((.type == "Ready" and .status != "True")
+				or (.status == "True" and (.type | IN("MemoryPressure", "DiskPressure", "PIDPressure", "NetworkUnavailable")))) | .type] | join(",")),
+			.status.allocatable.cpu, .status.allocatable.memory] | @tsv' 2>/dev/null)cmd")) {
+			if (f.size() < 5) continue;
+			//? Ready shows up when it's false, the pressure conditions when they're true
+			string flag = s_replace(f[2], "Ready", "NotReady");
+			if (f[1] == "true") flag = flag.empty() ? "cordoned" : flag;
+			out.push_back({f[0], s_replace(flag, "Pressure", " pressure"), quantity(f[3]), quantity(f[4])});
+		}
+		return out;
+	}
+
+	//? Per-pod usage and PVC usage straight from each kubelet's stats summary. The kubelet refreshes it every ~15s;
+	//? metrics-server re-serves the same numbers later, and nothing in Kubernetes has them any fresher
+	struct PodNet {
+		double rx{}, tx{}, rx_rate{}, tx_rate{}; // bytes, bytes/s
+		time_t at{}; // kubelet's sample time
+	};
+	std::unordered_map<string, PodNet> pod_net; // by "ns/name"
+
+	void add_usage(vector<Pod>& out_pods, vector<Pvc>& out_pvcs) {
+		vector<std::future<vector<vector<string>>>> fetches;
+		for (const auto& node : node_names)
+			fetches.push_back(std::async(std::launch::async, tsv, fmt::format(R"cmd(kubectl get --raw /api/v1/nodes/{}/proxy/stats/summary 2>/dev/null | jq -r '.pods[] |
+				(["pod", .podRef.namespace, .podRef.name, (.cpu.usageNanoCores // 0), (.memory.workingSetBytes // 0),
+				  (.network.time // ""), (.network.rxBytes // 0), (.network.txBytes // 0)] | @tsv),
+				(.volume[]? | select(.pvcRef) | ["pvc", .pvcRef.namespace, .pvcRef.name, (.usedBytes // 0), (.capacityBytes // 0)] | @tsv)' 2>/dev/null)cmd", node)));
+
+		std::unordered_map<string, Pod*> index;
+		for (auto& pod : out_pods) index[pod.ns + "/" + pod.name] = &pod;
+		std::unordered_set<string> seen_pvcs;
+		for (auto& fetch : fetches) {
+			for (const auto& f : fetch.get()) {
+				if (f.size() >= 5 and f[0] == "pvc") {
+					//? A volume mounted by several pods is reported once per pod
+					if (seen_pvcs.insert(f[1] + "/" + f[2]).second)
+						out_pvcs.push_back({f[1], f[2], std::strtod(f[3].c_str(), nullptr), std::strtod(f[4].c_str(), nullptr)});
+				}
+				else if (f.size() >= 8 and f[0] == "pod") {
+					const string key = f[1] + "/" + f[2];
+					auto it = index.find(key);
+					if (it == index.end()) continue;
+					auto& pod = *it->second;
+					pod.cpu = std::strtod(f[3].c_str(), nullptr) / 1e9;
+					pod.mem = std::strtod(f[4].c_str(), nullptr);
+					//? Host-network pods report the whole node's traffic
+					if (pod.host_network or f[5].empty()) continue;
+					//? A rate spans two kubelet samples and holds until the next one
+					const double rx = std::strtod(f[6].c_str(), nullptr), tx = std::strtod(f[7].c_str(), nullptr);
+					const time_t at = parse_time(f[5]);
+					auto& net = pod_net[key];
+					if (at > net.at) {
+						if (net.at > 0) {
+							net.rx_rate = max(0.0, rx - net.rx) / (at - net.at);
+							net.tx_rate = max(0.0, tx - net.tx) / (at - net.at);
+						}
+						net = {rx, tx, net.rx_rate, net.tx_rate, at};
+					}
+					pod.rx = net.rx_rate;
+					pod.tx = net.tx_rate;
+				}
+			}
+		}
+	}
+
+	vector<Events::event_info> fetch_flux(string& summary) {
+		vector<Events::event_info> out;
+		size_t total = 0, ready = 0, suspended = 0;
+		for (const auto& f : tsv(R"cmd(kubectl get kustomizations.kustomize.toolkit.fluxcd.io,helmreleases.helm.toolkit.fluxcd.io -A -o json 2>/dev/null | jq -r '.items[] |
+			((.status.conditions // []) | map(select(.type == "Ready")) | first // {}) as $ready |
+			[.kind, .metadata.namespace, .metadata.name, (.spec.suspend // false), ($ready.status // "Unknown"), ($ready.reason // ""),
+			 (($ready.message // "") | gsub("[\t\n]"; " ")), ($ready.lastTransitionTime // "")] | @tsv' 2>/dev/null)cmd")) {
+			if (f.size() < 8) continue;
+			total++;
+			if (f[3] == "true") suspended++;
+			else if (f[4] == "True") ready++;
+			else out.push_back({.source = "flux", .object = f[0] + "/" + f[2], .reason = f[5].empty() ? "NotReady" : f[5], .message = f[6], .at = parse_time(f[7])});
+		}
+		summary = total == 0 ? "" : fmt::format("{}/{} ready{}", ready, total - suspended, suspended > 0 ? fmt::format(", {} suspended", suspended) : "");
+		return out;
+	}
+
+	vector<Events::event_info> fetch_events() {
+		vector<Events::event_info> out;
+		for (const auto& f : tsv(R"cmd(kubectl get events -A --field-selector type=Warning -o json 2>/dev/null | jq -r '.items
+			| map(. + {at: (.lastTimestamp // .eventTime // .metadata.creationTimestamp)}) | sort_by(.at) | reverse | .[:50][] |
+			[.at, .metadata.namespace, (.involvedObject.kind + "/" + .involvedObject.name), .reason, (.count // 1),
+			 ((.message // "") | gsub("[\t\n]"; " "))] | @tsv' 2>/dev/null)cmd")) {
+			if (f.size() < 6) continue;
+			//? eventTime has fractional seconds, which parse_time stops before
+			out.push_back({.source = f[1], .object = f[2], .reason = f[3], .message = f[5], .at = parse_time(f[0].substr(0, 19) + "Z"),
+				.count = std::stoul(f[4])});
+		}
+		return out;
+	}
+
+	//? kubectl is slow and the kubelet only refreshes every ~15s, so this all runs off the runner thread
+	void kube_loop() {
 		while (not Global::quitting) {
-			auto fresh = fetch_pods();
+			auto flux_fetch = std::async(std::launch::async, [] { string summary; auto items = fetch_flux(summary); return std::pair{items, summary}; });
+			auto events_fetch = std::async(std::launch::async, fetch_events);
+			auto states_fetch = std::async(std::launch::async, fetch_node_states);
+			auto fresh_pods = fetch_pods();
+			vector<Pvc> fresh_pvcs;
+			add_usage(fresh_pods, fresh_pvcs);
+			auto [flux, summary] = flux_fetch.get();
+			auto fresh_events = std::move(flux);
+			rng::move(events_fetch.get(), std::back_inserter(fresh_events));
+			auto fresh_states = states_fetch.get();
 			{
-				std::lock_guard lock(pods_mutex);
-				pods = std::move(fresh);
+				std::lock_guard lock(kube_mutex);
+				pods = std::move(fresh_pods);
+				pvcs = std::move(fresh_pvcs);
+				events = std::move(fresh_events);
+				flux_summary = std::move(summary);
+				node_states = std::move(fresh_states);
 			}
 			for (int i = 0; i < 20 and not Global::quitting; i++) std::this_thread::sleep_for(std::chrono::milliseconds(250));
 		}
@@ -438,11 +597,12 @@ namespace Cluster {
 	std::unordered_map<string, Counter> ceph_counters; // "<pool id> rd" / "<pool id> wr"
 	std::mutex storage_mutex;
 	vector<Storage::storage_info> storage;
+	vector<Events::event_info> ceph_checks; // active health checks
 
 	//? Ceph pools smaller than this (rgw bookkeeping, .mgr, metadata) would bury the ones holding data
 	constexpr double min_pool_bytes = 1 << 30;
 
-	void add_ceph(string_view text, vector<Storage::storage_info>& out) {
+	void add_ceph(string_view text, vector<Storage::storage_info>& out, vector<Events::event_info>& checks) {
 		struct Pool {
 			string name, note;
 			double stored{}, avail{};
@@ -456,6 +616,8 @@ namespace Cluster {
 			if (name == "ceph_cluster_total_used_bytes") used = val;
 			else if (name == "ceph_cluster_total_bytes") total = val;
 			else if (name == "ceph_health_status") health = val;
+			else if (name == "ceph_health_detail" and val > 0)
+				checks.push_back({.source = "ceph", .object = string(label(labels, "name")), .reason = string(label(labels, "severity"))});
 			else if (name == "ceph_osd_up") osds++, osds_up += val > 0;
 			else if (name == "ceph_pool_metadata") {
 				pools[id].name = label(labels, "name");
@@ -528,7 +690,7 @@ namespace Cluster {
 		}
 	}
 
-	vector<Storage::storage_info> fetch_storage() {
+	vector<Storage::storage_info> fetch_storage(vector<Events::event_info>& checks) {
 		auto ceph = std::async(std::launch::async, run,
 			string("kubectl get --raw /api/v1/namespaces/rook-ceph/services/http:rook-ceph-mgr:9283/proxy/metrics 2>/dev/null"));
 		vector<std::future<string>> fetches;
@@ -545,7 +707,7 @@ namespace Cluster {
 		if (not ok) longhorn_managers = find_exporters("app=longhorn-manager");
 
 		vector<Storage::storage_info> out;
-		add_ceph(ceph.get(), out);
+		add_ceph(ceph.get(), out, checks);
 		add_longhorn(texts, out);
 		return out;
 	}
@@ -553,10 +715,12 @@ namespace Cluster {
 	void storage_loop() {
 		while (not Global::quitting) {
 			const auto start = time_ms();
-			auto fresh = fetch_storage();
+			vector<Events::event_info> checks;
+			auto fresh = fetch_storage(checks);
 			{
 				std::lock_guard lock(storage_mutex);
 				storage = std::move(fresh);
+				ceph_checks = std::move(checks);
 			}
 			//? Longhorn's throughput gauges and Ceph's counters move every few seconds at best
 			while (not Global::quitting and time_ms() - start < max<uint64_t>(Config::getI("update_ms"), 2000))
@@ -719,11 +883,12 @@ namespace Shared {
 
 		//? The storage box is sized from its row count at startup, so the first fetch happens here
 		Cluster::longhorn_managers = Cluster::find_exporters("app=longhorn-manager");
-		Cluster::storage = Cluster::fetch_storage();
+		Cluster::storage = Cluster::fetch_storage(Cluster::ceph_checks);
+		for (const auto& node : nodes) Cluster::node_names.push_back(node.name);
 
 		Cluster::scraped = nodes;
 		std::thread(Cluster::scrape_loop).detach();
-		std::thread(Cluster::pods_loop).detach();
+		std::thread(Cluster::kube_loop).detach();
 		std::thread(Cluster::storage_loop).detach();
 	}
 } // namespace Shared
@@ -1024,22 +1189,39 @@ namespace Nodes {
 		if (Runner::stopping or (no_update and not current_nodes.empty())) return current_nodes;
 		Cluster::refresh();
 
-		std::unordered_map<string, size_t> pods;
+		struct Requested {
+			size_t pods{};
+			double cpu{}, mem{};
+		};
+		std::unordered_map<string, Requested> requested;
+		vector<Cluster::NodeState> states;
 		{
-			std::lock_guard lock(Cluster::pods_mutex);
-			for (const auto& pod : Cluster::pods) pods[pod.node]++;
+			std::lock_guard lock(Cluster::kube_mutex);
+			for (const auto& pod : Cluster::pods) {
+				auto& r = requested[pod.node];
+				r.pods++;
+				r.cpu += pod.cpu_req;
+				r.mem += pod.mem_req;
+			}
+			states = Cluster::node_states;
 		}
 
 		current_nodes.clear();
 		for (const auto& node : nodes) {
 			auto get = [&](const string& key) { auto it = node.cur.mem.find(key); return it == node.cur.mem.end() ? 0.0 : it->second; };
+			const auto& r = requested[node.name];
+			const auto state = rng::find(states, node.name, &Cluster::NodeState::name);
+			const bool known = state != states.end();
 			current_nodes.push_back({
 				.name = node.name,
 				.addr = node.addr,
+				.flag = known ? state->flag : "",
 				.up = node.up,
 				.cores = node.cores,
-				.pods = pods[node.name],
+				.pods = r.pods,
 				.cpu = (long long)round(Cluster::busy(node, 0, node.cores) * 100),
+				.cpu_req = known and state->cpu_alloc > 0 ? (long long)round(r.cpu * 100 / state->cpu_alloc) : 0,
+				.mem_req = known and state->mem_alloc > 0 ? (long long)round(r.mem * 100 / state->mem_alloc) : 0,
 				.mem_used = (uint64_t)(get("MemTotal") - get("MemAvailable")),
 				.mem_total = (uint64_t)get("MemTotal"),
 				.rx = (uint64_t)Cluster::rate(node, node.cur.rx, node.prev.rx),
@@ -1054,13 +1236,57 @@ namespace Nodes {
 namespace Storage {
 	vector<storage_info> current_rows;
 
+	//? Usually one PVC fills up long before its backend does, so the fullest few get rows of their own
+	constexpr size_t pvc_rows = 5;
+
 	auto collect(bool no_update) -> vector<storage_info>& {
 		if (Runner::stopping or (no_update and not current_rows.empty())) return current_rows;
-		std::lock_guard lock(Cluster::storage_mutex);
-		current_rows = Cluster::storage;
+		{
+			std::lock_guard lock(Cluster::storage_mutex);
+			current_rows = Cluster::storage;
+		}
+		vector<Cluster::Pvc> pvcs;
+		{
+			std::lock_guard lock(Cluster::kube_mutex);
+			pvcs = Cluster::pvcs;
+		}
+		if (pvcs.empty()) return current_rows;
+
+		auto& header = current_rows.emplace_back(storage_info{.name = "pvcs", .note = fmt::format("{} mounted", pvcs.size()), .header = true});
+		for (const auto& pvc : pvcs) {
+			header.used += pvc.used;
+			header.total += pvc.capacity;
+		}
+		auto fullness = [](const Cluster::Pvc& pvc) { return pvc.capacity > 0 ? pvc.used / pvc.capacity : 0; };
+		rng::sort(pvcs, rng::greater{}, fullness);
+		for (const auto& pvc : pvcs | std::views::take(pvc_rows))
+			current_rows.push_back({.name = pvc.name, .note = pvc.ns, .used = (uint64_t)pvc.used, .total = (uint64_t)pvc.capacity});
 		return current_rows;
 	}
 } // namespace Storage
+
+namespace Events {
+	vector<event_info> current_rows;
+
+	auto collect(bool no_update) -> vector<event_info>& {
+		if (Runner::stopping or (no_update and not current_rows.empty())) return current_rows;
+		current_rows.clear();
+		vector<event_info> checks;
+		{
+			std::lock_guard lock(Cluster::storage_mutex);
+			checks = Cluster::ceph_checks;
+		}
+		std::lock_guard lock(Cluster::kube_mutex);
+		current_rows.push_back({.source = "flux", .reason = Cluster::flux_summary.empty() ? "not found" : Cluster::flux_summary});
+		//? Flux's not-Ready objects lead the events, then Ceph's checks, then the Warning events
+		auto events = Cluster::events;
+		const auto flux_end = rng::find_if_not(events, [](const auto& e) { return e.source == "flux"; });
+		current_rows.insert(current_rows.end(), events.begin(), flux_end);
+		current_rows.insert(current_rows.end(), checks.begin(), checks.end());
+		current_rows.insert(current_rows.end(), flux_end, events.end());
+		return current_rows;
+	}
+} // namespace Events
 
 namespace Proc {
 	vector<proc_info> current_procs;
@@ -1086,10 +1312,32 @@ namespace Proc {
 		return it->second;
 	}
 
+	//? Pods within this fraction of their memory limit are flagged before the OOM killer gets to them
+	constexpr double near_limit = 0.9;
+
+	//* A pod's status column (ready/containers, restarts, the most pressing problem) and its state letter:
+	//* R running, P starting, E failing, W running but OOM-killed before or close to its memory limit
+	std::pair<string, char> health(const Cluster::Pod& pod) {
+		string status = fmt::format("{}/{}", pod.ready, pod.containers);
+		if (pod.restarts > 0) status += fmt::format(" ↻{}", pod.restarts);
+		const auto with = [&](const string& flag) { return status + ' ' + flag; };
+		if (is_in(pod.problem, "ContainerCreating", "PodInitializing") or (pod.problem.empty() and pod.phase == "Pending"))
+			return {with(pod.problem.empty() ? "Pending" : pod.problem), 'P'};
+		if (not pod.problem.empty()) return {with(pod.problem), 'E'};
+		if (pod.ready < pod.containers) return {with("NotReady"), 'E'};
+		if (pod.mem_limit > 0 and pod.mem >= pod.mem_limit * near_limit)
+			return {with(fmt::format("mem {:.0f}% of limit", pod.mem * 100 / pod.mem_limit)), 'W'};
+		if (pod.last_exit == "OOMKilled") return {with("last OOMKilled"), 'W'};
+		if (pod.cpu_req > 0 and pod.cpu > pod.cpu_req * 1.5) return {with(fmt::format("cpu {:.1f}x request", pod.cpu / pod.cpu_req)), 'R'};
+		return {status, 'R'};
+	}
+
 	string get_status(char s) {
 		switch (s) {
 			case 'R': return "Running";
 			case 'P': return "Pending";
+			case 'E': return "Failing";
+			case 'W': return "Warning";
 			default: return "Unknown";
 		}
 	}
@@ -1167,7 +1415,7 @@ namespace Proc {
 			found.clear();
 			vector<Cluster::Pod> pods;
 			{
-				std::lock_guard lock(Cluster::pods_mutex);
+				std::lock_guard lock(Cluster::kube_mutex);
 				pods = Cluster::pods;
 			}
 
@@ -1216,14 +1464,19 @@ namespace Proc {
 				}
 				if (auto* p = entry(pid_of(pod.ns + "/" + pod.name))) {
 					p->name = pod.name;
-					//? The command column starts with a 14-wide node column (see Proc::draw's header); the tree shows it in parentheses
-					p->cmd = tree ? pod.node + " " + pod.images : fmt::format("{:<14}{}", pod.node.substr(0, 13), pod.images);
+					const auto [status, state] = health(pod);
+					//? The command column holds node, status and network columns before the images (see Proc::draw's header);
+					//? the tree shows it in parentheses, so there it skips the padding and network
+					const string net = pod.host_network ? "host net"
+						: fmt::format("▼{} ▲{}", floating_humanizer(pod.rx, true), floating_humanizer(pod.tx, true));
+					p->cmd = tree ? fmt::format("{} {} {}", pod.node, status, pod.images)
+						: ljust(pod.node, 13, true) + ' ' + ljust(status, 25, true) + ' ' + ljust(net, 15, true) + ' ' + pod.images;
 					p->user = pod.ns;
 					p->threads = pod.containers;
 					p->mem = pod.mem;
 					p->cpu_p = pod.cpu * scale;
 					p->cpu_c = p->cpu_p;
-					p->state = pod.phase == "Running" ? 'R' : 'P';
+					p->state = state;
 					p->cpu_s = pod.start * 1'000'000;
 					p->ppid = tree ? pid_of(parent) : 0;
 				}

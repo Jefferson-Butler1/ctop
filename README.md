@@ -5,14 +5,17 @@ btop for a whole Kubernetes cluster. A fork of btop with one extra collector bac
 * **cpu**: every node's cores appended, labelled by node initial (`p12` = core 12 on the node starting with `p`)
 * **mem**: memory summed across nodes; one disk per node filesystem (`node:/mount`)
 * **net**: one interface per node plus `cluster` (all of them); cycle with `b`/`n`
-* **nodes** (`5`): one row per node (cpu, memory, network, pod count, load), above the pod list
-* **storage** (`6`): Ceph (rook-ceph mgr metrics: raw usage, OSDs, health, pools over 1 GiB) and Longhorn (each node's disk, volume count) with read/write rates, below the nodes box
-* **gpu** (`7`+): one box per NVIDIA GPU in the cluster, read from the GPU operator's dcgm-exporter through the API server
-* **proc**: pods as processes, with their node and namespace; tree mode (`e`) groups them as namespace › workload › pod, with each group showing its pods' totals (`E` collapses to namespaces)
+* **nodes** (`5`): one row per node (cpu, memory, network, pod count, load, cpu/memory requested of allocatable), flagged red when NotReady, cordoned or under pressure
+* **storage** (`6`): Ceph (rook-ceph mgr metrics: raw usage, OSDs, health, pools over 1 GiB) and Longhorn (each node's disk, volume count) with read/write rates, then the five fullest PVCs
+* **events** (`7`): Flux's ready count and any Kustomization or HelmRelease that isn't Ready, Ceph's active health checks, then the latest Warning events
+* **gpu** (`8`+): one box per NVIDIA GPU in the cluster, read from the GPU operator's dcgm-exporter through the API server
+* **proc**: pods as processes, with their node, status (ready containers, restarts, the most pressing problem) and network rates; failing pods are red, pods near their memory limit or OOM-killed before are amber. Tree mode (`e`) groups them as namespace › workload › pod, with each group showing its pods' totals (`E` collapses to namespaces)
+
+Pod usage comes from each kubelet's stats summary, which the kubelet refreshes every ~15s; nothing in Kubernetes has per-pod numbers any fresher.
 
 It's read-only: signal and nice actions are compiled out, since pod pids are synthetic.
 
-Needs `kubectl` (current context, with metrics-server for pod usage), `curl`, and node-exporter reachable on each node's InternalIP.
+Needs `kubectl` (current context), `jq`, `curl`, and node-exporter reachable on each node's InternalIP.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j

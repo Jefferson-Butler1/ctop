@@ -52,7 +52,7 @@ const vector<string> Config::valid_graph_symbols_def = { "default", "braille", "
 const vector<string> Config::valid_boxes = {
 	"cpu", "mem", "net", "proc"
 #ifdef CTOP_CLUSTER
-	,"node", "storage"
+	,"node", "storage", "events"
 #endif
 #ifdef GPU_SUPPORT
 	,"gpu0", "gpu1", "gpu2", "gpu3", "gpu4", "gpu5"
@@ -128,7 +128,7 @@ namespace Config {
 
 		{"graph_symbol_proc", 	"# Graph symbol to use for graphs in cpu box, \"default\", \"braille\", \"block\" or \"tty\"."},
 
-		{"shown_boxes", 		"#* Manually set which boxes to show. Available values are \"cpu mem net proc\" (plus \"node\" and \"storage\" in ctop) and \"gpu0\" through \"gpu5\", separate values with whitespace."},
+		{"shown_boxes", 		"#* Manually set which boxes to show. Available values are \"cpu mem net proc\" (plus \"node\", \"storage\" and \"events\" in ctop) and \"gpu0\" through \"gpu5\", separate values with whitespace."},
 
 		{"update_ms", 			"#* Update time in milliseconds, recommended 2000 ms or above for better sample times for graphs."},
 
@@ -283,7 +283,7 @@ namespace Config {
 	std::unordered_map<std::string_view, string> strings = {
 		{"color_theme", "Default"},
 #ifdef CTOP_CLUSTER
-		{"shown_boxes", "cpu mem net proc node storage gpu0 gpu1 gpu2 gpu3 gpu4 gpu5"},
+		{"shown_boxes", "cpu mem net proc node storage events gpu0 gpu1 gpu2 gpu3 gpu4 gpu5"},
 #else
 		{"shown_boxes", "cpu mem net proc"},
 #endif

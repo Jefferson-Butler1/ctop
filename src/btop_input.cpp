@@ -239,9 +239,9 @@ namespace Input {
 				else if (key.size() == 1 and isint(key)) {
 					auto intKey = std::atoi(key.data());
 				#if defined(CTOP_CLUSTER)
-					//? 5 and 6 are the nodes and storage boxes, so GPUs start at 7 (and a fifth GPU has no key)
-					static const array<string, 10> boxes = {"gpu3", "cpu", "mem", "net", "proc", "node", "storage", "gpu0", "gpu1", "gpu2"};
-					if ((intKey == 0 and Gpu::count < 4) or (intKey >= 7 and intKey - 6 > Gpu::count))
+					//? 5, 6 and 7 are the nodes, storage and events boxes, so GPUs start at 8 (and a fourth GPU has no key)
+					static const array<string, 10> boxes = {"gpu2", "cpu", "mem", "net", "proc", "node", "storage", "events", "gpu0", "gpu1"};
+					if ((intKey == 0 and Gpu::count < 3) or (intKey >= 8 and intKey - 7 > Gpu::count))
 						return;
 				#elif defined(GPU_SUPPORT)
 					static const array<string, 10> boxes = {"gpu5", "cpu", "mem", "net", "proc", "gpu0", "gpu1", "gpu2", "gpu3", "gpu4"};

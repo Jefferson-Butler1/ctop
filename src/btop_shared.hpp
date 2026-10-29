@@ -371,9 +371,10 @@ namespace Nodes {
 
 	struct node_info {
 		string name, addr;
+		string flag; // NotReady, cordoned or a pressure condition, empty when fine
 		bool up{};
 		size_t cores{}, pods{};
-		long long cpu{}; // percent
+		long long cpu{}, cpu_req{}, mem_req{}; // percent; requests are of allocatable
 		uint64_t mem_used{}, mem_total{}, rx{}, tx{}; // bytes, bytes/s
 		double load{};
 	};
@@ -387,6 +388,7 @@ namespace Storage {
 	extern string box;
 	extern int x, y, width, height;
 	extern bool shown, redraw;
+	extern size_t sized_rows; // row count the box was laid out for
 
 	//? A header row holds a backend's totals, the rows after it its pools or disks
 	struct storage_info {
@@ -397,6 +399,25 @@ namespace Storage {
 
 	auto collect(bool no_update = false) -> vector<storage_info>&;
 	string draw(const vector<storage_info>& rows, bool force_redraw = false, bool data_same = false);
+}
+
+//* What needs attention: Flux objects that aren't Ready, Ceph health checks and Warning events, drawn below storage
+namespace Events {
+	extern string box;
+	extern int x, y, width, height;
+	extern bool shown, redraw;
+	extern size_t sized_rows;
+	constexpr size_t max_rows = 10;
+
+	struct event_info {
+		string source, object, reason, message; // source: "flux", "ceph" or the event's namespace
+		time_t at{}; // 0 when unknown
+		size_t count{};
+	};
+
+	//? The first row is always Flux's summary
+	auto collect(bool no_update = false) -> vector<event_info>&;
+	string draw(const vector<event_info>& rows, bool force_redraw = false, bool data_same = false);
 }
 #endif
 
