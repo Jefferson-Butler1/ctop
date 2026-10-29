@@ -141,7 +141,9 @@ void term_resize(bool force) {
 		if (force and refreshed) force = false;
 	}
 	else return;
-#ifdef GPU_SUPPORT
+#if defined(CTOP_CLUSTER)
+	static const array<string, 10> all_boxes = {"gpu2", "cpu", "mem", "net", "proc", "node", "storage", "events", "gpu0", "gpu1"};
+#elif defined(GPU_SUPPORT)
 	static const array<string, 10> all_boxes = {"gpu5", "cpu", "mem", "net", "proc", "gpu0", "gpu1", "gpu2", "gpu3", "gpu4"};
 #else
 	static const array<string, 5> all_boxes = {"", "cpu", "mem", "net", "proc"};
@@ -185,7 +187,9 @@ void term_resize(bool force) {
 					clean_quit(0);
 				else if (key.size() == 1 and isint(key)) {
 					auto intKey = stoi(key);
-				#ifdef GPU_SUPPORT
+				#if defined(CTOP_CLUSTER)
+					if ((intKey == 0 and Gpu::count >= 3) or (intKey >= 5 and intKey <= 7) or (intKey >= 8 and intKey - 7 <= Gpu::count)) {
+				#elif defined(GPU_SUPPORT)
 					if ((intKey == 0 and Gpu::count >= 5) or (intKey >= 5 and intKey - 4 <= Gpu::count)) {
 				#else
 					if (intKey > 0 and intKey < 5) {
@@ -622,6 +626,47 @@ namespace Runner {
 						throw std::runtime_error("Net:: -> " + string{e.what()});
 					}
 				}
+
+			#ifdef CTOP_CLUSTER
+				//? NODES
+				if (v_contains(conf.boxes, "node") and v_contains(conf.boxes, "proc")) {
+					try {
+						auto nodes = Nodes::collect(conf.no_update);
+						if (not pause_output) output += Nodes::draw(nodes, conf.force_redraw, conf.no_update);
+					}
+					catch (const std::exception& e) {
+						throw std::runtime_error("Nodes:: -> " + string{e.what()});
+					}
+				}
+
+				//? STORAGE and EVENTS; their row counts change as data arrives, and the layout follows
+				if (v_contains(conf.boxes, "storage") and v_contains(conf.boxes, "proc")) {
+					try {
+						auto rows = Storage::collect(conf.no_update);
+						if (rows.size() != Storage::sized_rows) {
+							Global::resized = true;
+							Input::interrupt();
+						}
+						else if (not pause_output) output += Storage::draw(rows, conf.force_redraw, conf.no_update);
+					}
+					catch (const std::exception& e) {
+						throw std::runtime_error("Storage:: -> " + string{e.what()});
+					}
+				}
+				if (v_contains(conf.boxes, "events") and v_contains(conf.boxes, "proc")) {
+					try {
+						auto rows = Events::collect(conf.no_update);
+						if (min(rows.size(), Events::max_rows) != Events::sized_rows) {
+							Global::resized = true;
+							Input::interrupt();
+						}
+						else if (not pause_output) output += Events::draw(rows, conf.force_redraw, conf.no_update);
+					}
+					catch (const std::exception& e) {
+						throw std::runtime_error("Events:: -> " + string{e.what()});
+					}
+				}
+			#endif
 
 				//? PROC
 				if (v_contains(conf.boxes, "proc")) {

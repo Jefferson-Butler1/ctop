@@ -217,7 +217,7 @@ namespace Input {
 			auto filtering = Config::getB("proc_filtering");
 			auto vim_keys = Config::getB("vim_keys");
 			auto help_key = (vim_keys ? "H" : "h");
-			auto kill_key = (vim_keys ? "K" : "k");
+			[[maybe_unused]] auto kill_key = (vim_keys ? "K" : "k");
 			//? Global input actions
 			if (not filtering) {
 				bool keep_going = false;
@@ -238,7 +238,12 @@ namespace Input {
 				}
 				else if (key.size() == 1 and isint(key)) {
 					auto intKey = std::atoi(key.data());
-				#ifdef GPU_SUPPORT
+				#if defined(CTOP_CLUSTER)
+					//? 5, 6 and 7 are the nodes, storage and events boxes, so GPUs start at 8 (and a fourth GPU has no key)
+					static const array<string, 10> boxes = {"gpu2", "cpu", "mem", "net", "proc", "node", "storage", "events", "gpu0", "gpu1"};
+					if ((intKey == 0 and Gpu::count < 3) or (intKey >= 8 and intKey - 7 > Gpu::count))
+						return;
+				#elif defined(GPU_SUPPORT)
 					static const array<string, 10> boxes = {"gpu5", "cpu", "mem", "net", "proc", "gpu0", "gpu1", "gpu2", "gpu3", "gpu4"};
 					if ((intKey == 0 and Gpu::count < 5) or (intKey >= 5 and intKey - 4 > Gpu::count))
 						return;
@@ -501,6 +506,7 @@ namespace Input {
 					else
 						keep_going = true;
 				}
+#ifndef CTOP_CLUSTER // pods have synthetic pids, so signalling or renicing them would hit local processes
 				else if (is_in(key, "t", kill_key) and (Config::getB("show_detailed") or Config::getI("selected_pid") > 0)) {
 					atomic_wait(Runner::active);
 					if (Config::getB("show_detailed") and Config::getI("proc_selected") == 0 and Proc::detailed.status == "Dead") return;
@@ -519,6 +525,7 @@ namespace Input {
 				    Menu::show(Menu::Menus::Renice);
 				    return;
 			    }
+#endif
 				else if (is_in(key, "up", "down", "page_up", "page_down", "home", "end") or (vim_keys and is_in(key, "j", "k", "g", "G"))) {
 					proc_mouse_scroll:
 					redraw = false;

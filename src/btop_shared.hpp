@@ -260,6 +260,9 @@ namespace Cpu {
 	auto get_battery() -> tuple<int, float, long, string>;
 
 	string trim_name(string);
+
+	//* Optional per-core labels (cluster backend: node initial + core index), drawn instead of C<n>
+	extern vector<string> core_labels;
 }
 
 namespace Mem {
@@ -358,6 +361,65 @@ namespace Net {
 	//* Draw contents of net box using <net> as source
 	string draw(const net_info& net, bool force_redraw = false, bool data_same = false);
 }
+
+#ifdef CTOP_CLUSTER
+//* Cluster nodes, drawn in their own box above the pod list
+namespace Nodes {
+	extern string box;
+	extern int x, y, width, height;
+	extern bool shown, redraw;
+
+	struct node_info {
+		string name, addr;
+		string flag; // NotReady, cordoned or a pressure condition, empty when fine
+		bool up{};
+		size_t cores{}, pods{};
+		long long cpu{}, cpu_req{}, mem_req{}; // percent; requests are of allocatable
+		uint64_t mem_used{}, mem_total{}, rx{}, tx{}; // bytes, bytes/s
+		double load{};
+	};
+
+	auto collect(bool no_update = false) -> vector<node_info>&;
+	string draw(const vector<node_info>& nodes, bool force_redraw = false, bool data_same = false);
+}
+
+//* Cluster storage backends (Ceph, Longhorn), drawn in their own box below the nodes
+namespace Storage {
+	extern string box;
+	extern int x, y, width, height;
+	extern bool shown, redraw;
+	extern size_t sized_rows; // row count the box was laid out for
+
+	//? A header row holds a backend's totals, the rows after it its pools or disks
+	struct storage_info {
+		string name, note;
+		bool header{};
+		uint64_t used{}, total{}, rd{}, wr{}; // bytes, bytes/s
+	};
+
+	auto collect(bool no_update = false) -> vector<storage_info>&;
+	string draw(const vector<storage_info>& rows, bool force_redraw = false, bool data_same = false);
+}
+
+//* What needs attention: Flux objects that aren't Ready, Ceph health checks and Warning events, drawn below storage
+namespace Events {
+	extern string box;
+	extern int x, y, width, height;
+	extern bool shown, redraw;
+	extern size_t sized_rows;
+	constexpr size_t max_rows = 10;
+
+	struct event_info {
+		string source, object, reason, message; // source: "flux", "ceph" or the event's namespace
+		time_t at{}; // 0 when unknown
+		size_t count{};
+	};
+
+	//? The first row is always Flux's summary
+	auto collect(bool no_update = false) -> vector<event_info>&;
+	string draw(const vector<event_info>& rows, bool force_redraw = false, bool data_same = false);
+}
+#endif
 
 namespace Proc {
 	extern atomic<int> numpids;

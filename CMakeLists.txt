@@ -30,6 +30,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(BTOP_STATIC "Link btop statically" OFF)
 option(BTOP_GPU "Enable GPU support" ON)
+option(CTOP_CLUSTER "Build ctop: collect from the Kubernetes cluster instead of the local machine" ON)
+if(CTOP_CLUSTER)
+  set(BTOP_GPU OFF CACHE BOOL "" FORCE)
+endif()
 cmake_dependent_option(BTOP_RSMI_STATIC "Link statically to ROCm SMI" OFF "BTOP_GPU" OFF)
 
 # Enable LTO in release builds by default
@@ -66,7 +70,11 @@ if(BTOP_LTO)
   set_target_properties(libbtop PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
-if(APPLE)
+if(CTOP_CLUSTER)
+  target_sources(libbtop PRIVATE src/cluster/btop_collect.cpp)
+  target_compile_definitions(libbtop PUBLIC CTOP_CLUSTER GPU_SUPPORT)
+  set_target_properties(btop PROPERTIES OUTPUT_NAME ctop)
+elseif(APPLE)
   target_sources(libbtop PRIVATE src/osx/btop_collect.cpp src/osx/sensors.cpp src/osx/smc.cpp)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "MidnightBSD")
   target_sources(libbtop PRIVATE src/freebsd/btop_collect.cpp)

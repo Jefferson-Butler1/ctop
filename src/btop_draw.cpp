@@ -913,8 +913,11 @@ namespace Cpu {
 		if (Shared::coreCount >= 100) core_width++;
 		for (const auto& n : iota(0, Shared::coreCount)) {
 			auto enabled = is_cpu_enabled(n);
-			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + Theme::c(enabled ? "main_fg" : "inactive_fg") + (Shared::coreCount < 100 ? Fx::b + 'C' + Fx::ub : "")
-				+ ljust(to_string(n), core_width);
+			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + Theme::c(enabled ? "main_fg" : "inactive_fg");
+			if (cmp_less(n, Cpu::core_labels.size()))
+				out += Fx::b + Cpu::core_labels[n].substr(0, 1) + Fx::ub + ljust(Cpu::core_labels[n].substr(1), core_width);
+			else
+				out += (Shared::coreCount < 100 ? Fx::b + 'C' + Fx::ub : "") + ljust(to_string(n), core_width);
 			if ((b_column_size > 0 or extra_width > 0) and cmp_less(n, core_graphs.size()))
 				out += Theme::c("inactive_fg") + graph_bg * (5 * b_column_size + extra_width) + Mv::l(5 * b_column_size + extra_width)
 					+ core_graphs.at(n)(safeVal(cpu.core_percent, n), data_same or redraw);
@@ -1600,6 +1603,133 @@ namespace Net {
 
 }
 
+#ifdef CTOP_CLUSTER
+namespace Nodes {
+	int x = 1, y, width, height;
+	bool shown = true, redraw = true;
+	string box;
+
+	string draw(const vector<node_info>& nodes, bool force_redraw, bool) {
+		if (Runner::stopping or height < 3) return "";
+		if (force_redraw) redraw = true;
+		string out;
+		out.reserve(width * height);
+		if (redraw) out = box;
+
+		//? name, cpu meter + %, mem meter + %, net, pods, load, requests, flag; meters take whatever width is left
+		const int name_w = 14, flag_w = 15, rest_w = 5 + 6 + 22 + 10 + 10 + 14 + flag_w;
+		const int meter_w = max(4, (width - 2 - name_w - rest_w) / 2);
+		Draw::Meter cpu_meter{meter_w, "cpu"}, mem_meter{meter_w, "used"};
+
+		for (int row = 0; const auto& node : nodes) {
+			if (row >= height - 2) break;
+			const string flag_color = node.flag.empty() ? Theme::c("title") : Theme::g("cpu").at(100);
+			out += Mv::to(y + 1 + row++, x + 1) + flag_color + Fx::b + ljust(node.name, name_w, true) + Fx::ub;
+			if (not node.up) {
+				out += Theme::c("inactive_fg") + ljust("down", width - 2 - name_w);
+				continue;
+			}
+			const long long mem_pct = node.mem_total > 0 ? round((double)node.mem_used * 100 / node.mem_total) : 0;
+			out += cpu_meter(node.cpu) + Theme::g("cpu").at(clamp(node.cpu, 0ll, 100ll)) + rjust(to_string(node.cpu), 4) + Theme::c("main_fg") + "% "
+				+ mem_meter(mem_pct) + Theme::g("used").at(clamp(mem_pct, 0ll, 100ll)) + rjust(to_string(mem_pct), 4) + Theme::c("main_fg") + "% "
+				+ Theme::c("main_fg") + " ▼" + rjust(floating_humanizer(node.rx, true, 0, false, true), 9)
+				+ " ▲" + rjust(floating_humanizer(node.tx, true, 0, false, true), 9)
+				+ rjust(to_string(node.pods), 5) + Theme::c("inactive_fg") + " pods"
+				+ Theme::c("main_fg") + rjust(fmt::format("{:.1f}", node.load), 6) + Theme::c("inactive_fg") + " ld"
+				+ " req" + Theme::c("main_fg") + rjust(fmt::format("{}/{}", node.cpu_req, node.mem_req), 8) + Theme::c("inactive_fg") + "%"
+				+ flag_color + Fx::b + rjust(node.flag, flag_w, true) + Fx::ub;
+		}
+
+		redraw = false;
+		return out + Fx::reset;
+	}
+}
+
+namespace Storage {
+	int x = 1, y, width, height;
+	bool shown = true, redraw = true;
+	size_t sized_rows = 0;
+	string box;
+
+	string draw(const vector<storage_info>& rows, bool force_redraw, bool) {
+		if (Runner::stopping or height < 3) return "";
+		if (force_redraw) redraw = true;
+		string out;
+		out.reserve(width * height);
+		if (redraw) out = box;
+
+		//? name, usage meter + %, used/total, read/write, note; the meter takes whatever width is left
+		int name_w = 10;
+		for (const auto& row : rows) name_w = max(name_w, (int)ulen(row.name) + 1);
+		name_w = min(name_w, 34);
+		const int note_w = 22, rest_w = 6 + 16 + 22 + 1 + note_w;
+		Draw::Meter meter{max(4, width - 2 - name_w - rest_w), "used"};
+
+		for (int row = 0; row < height - 2; row++) {
+			out += Mv::to(y + 1 + row, x + 1);
+			if (row >= (int)rows.size()) {
+				out += string(width - 2, ' ');
+				continue;
+			}
+			const auto& r = rows[row];
+			const long long pct = r.total > 0 ? round((double)r.used * 100 / r.total) : 0;
+			out += (r.header ? Theme::c("title") + Fx::b : Theme::c("main_fg")) + ljust(r.name, name_w - 1, true) + Fx::ub + ' '
+				+ meter(pct) + Theme::g("used").at(clamp(pct, 0ll, 100ll)) + rjust(to_string(pct), 4) + Theme::c("main_fg") + "% "
+				+ rjust(floating_humanizer(r.used, true) + "/" + floating_humanizer(r.total, true), 15)
+				+ " ▼" + rjust(floating_humanizer(r.rd, true, 0, false, true), 9)
+				+ " ▲" + rjust(floating_humanizer(r.wr, true, 0, false, true), 9)
+				+ Theme::c("inactive_fg") + "  " + ljust(r.note, note_w, true);
+		}
+
+		redraw = false;
+		return out + Fx::reset;
+	}
+}
+
+namespace Events {
+	int x = 1, y, width, height;
+	bool shown = true, redraw = true;
+	size_t sized_rows = 0;
+	string box;
+
+	string draw(const vector<event_info>& rows, bool force_redraw, bool) {
+		if (Runner::stopping or height < 3) return "";
+		if (force_redraw) redraw = true;
+		string out;
+		out.reserve(width * height);
+		if (redraw) out = box;
+
+		//? age, source, object, reason (×count), message; the message takes whatever width is left
+		const int age_w = 5, source_w = 16, object_w = 34, reason_w = 24;
+		const int message_w = max(0, width - 2 - age_w - source_w - object_w - reason_w - 4);
+		const auto now = time(nullptr);
+		for (int row = 0; row < height - 2; row++) {
+			out += Mv::to(y + 1 + row, x + 1);
+			if (row >= (int)rows.size()) {
+				out += string(width - 2, ' ');
+				continue;
+			}
+			const auto& e = rows[row];
+			//? Flux's summary and ongoing conditions (Flux, Ceph) stand out from the event log
+			const bool ongoing = is_in(e.source, "flux", "ceph");
+			const time_t secs = max<time_t>(0, now - e.at);
+			const string age = e.at <= 0 ? "" : secs < 60 ? fmt::format("{}s", secs) : secs < 3600 ? fmt::format("{}m", secs / 60)
+				: secs < 86400 ? fmt::format("{}h", secs / 3600) : fmt::format("{}d", secs / 86400);
+			const string reason = e.count > 1 ? fmt::format("{} ×{}", e.reason, e.count) : e.reason;
+			out += Theme::c("inactive_fg") + rjust(age, age_w, true) + ' '
+				+ (row == 0 ? Theme::c("title") + Fx::b : ongoing ? Theme::g("cpu").at(100) + Fx::b : Theme::c("main_fg"))
+				+ ljust(e.source, source_w - 1, true) + Fx::ub + ' '
+				+ Theme::c("main_fg") + ljust(e.object, object_w - 1, true) + ' '
+				+ (row == 0 ? Theme::c("main_fg") : Theme::g("cpu").at(ongoing ? 100 : 60)) + ljust(reason, reason_w - 1, true) + ' '
+				+ Theme::c("inactive_fg") + ljust(e.message, message_w, true);
+		}
+
+		redraw = false;
+		return out + Fx::reset;
+	}
+}
+#endif
+
 namespace Proc {
 	int width_p = 55, height_p = 68;
 	int min_width = 44, min_height = 16;
@@ -1714,7 +1844,7 @@ namespace Proc {
 		auto& graph_symbol = (tty_mode ? "tty" : Config::getS("graph_symbol_proc"));
 		auto& graph_bg = Symbols::graph_symbols.at((graph_symbol == "default" ? Config::getS("graph_symbol") + "_up" : graph_symbol + "_up")).at(6);
 		auto mem_bytes = Config::getB("proc_mem_bytes");
-		auto vim_keys = Config::getB("vim_keys");
+		[[maybe_unused]] auto vim_keys = Config::getB("vim_keys");
 		auto show_graphs = Config::getB("proc_cpu_graphs");
 		const auto pause_proc_list = Config::getB("pause_proc_list");
 		auto follow_process = Config::getB("follow_process");
@@ -1844,6 +1974,7 @@ namespace Proc {
 				const string hi_color = (not alive or selected > 0 ? t_color : Theme::c("hi_fg"));
 				int mouse_x = d_x + 2;
 				out += Mv::to(d_y, d_x + 1);
+#ifndef CTOP_CLUSTER // read-only: no signal or nice actions on pods
 				if (width > 55) {
 					out += Fx::ub + title_left + hi_color + Fx::b + 't' + t_color + "erminate" + Fx::ub + title_right;
 					if (alive and selected == 0) Input::mouse_mappings["t"] = {d_y, mouse_x, 1, 9};
@@ -1860,6 +1991,7 @@ namespace Proc {
 					Input::mouse_mappings["N"] = {d_y, mouse_x, 1, 5};
 				    mouse_x += 7;
 				}
+#endif
 				if (width > 77) {
 				    fmt::format_to(std::back_inserter(out), "{}{}{}{}{}{}{}{}",
 				    	title_left, follow_process ? Fx::b : "",
@@ -1955,6 +2087,7 @@ namespace Proc {
 				+ title_left_down + Fx::b + t_color + "info " + hi_color + Symbols::enter + Fx::ub + title_right_down;
 				if (selected > 0) Input::mouse_mappings["info_enter"] = {y + height - 1, mouse_x, 1, 6};
 				mouse_x += 8;
+#ifndef CTOP_CLUSTER // read-only: no signal or nice actions on pods
 			if (width > 60) {
 				out += title_left_down + Fx::b + hi_color + 't' + t_color + "erminate" + Fx::ub + title_right_down;
 				if (selected > 0) Input::mouse_mappings["t"] = {y + height - 1, mouse_x, 1, 9};
@@ -1971,6 +2104,7 @@ namespace Proc {
 		    out += title_left_down + Fx::b + hi_color + 'N' + t_color + "ice" + Fx::ub + title_right_down;
 		    if (selected > 0) Input::mouse_mappings["N"] = {y + height -1, mouse_x, 1, 5};
 			mouse_x += 6;
+#endif
 			if (width > 72) {
 			    fmt::format_to(std::back_inserter(out), "{}{}{}{}{}{}{}{}",
 			    	title_left_down, follow_process ? Fx::b : "",
@@ -1984,13 +2118,21 @@ namespace Proc {
 				out += Mv::to(y+1, x+1) + Theme::c("title") + Fx::b
 					+ rjust("Pid:", 8) + ' '
 					+ ljust("Program:", prog_size) + ' '
+#ifdef CTOP_CLUSTER
+					+ (cmd_size > 0 ? ljust(ljust("Node:", 14) + ljust("Status:", 26) + ljust("Net:", 16) + "Images:", cmd_size) : "") + ' ';
+#else
 					+ (cmd_size > 0 ? ljust("Command:", cmd_size) : "") + ' ';
+#endif
 			else
 				out += Mv::to(y+1, x+1) + Theme::c("title") + Fx::b
 					+ ljust("Tree:", tree_size) + ' ';
 
 			out += (thread_size > 0 ? Mv::l(4) + "Threads: " : "")
+#ifdef CTOP_CLUSTER
+					+ ljust("Namespace:", user_size) + ' '
+#else
 					+ ljust("User:", user_size) + ' '
+#endif
 					+ rjust((mem_bytes ? "MemB" : "Mem%"), 5) + ' '
 					+ rjust("Cpu%", (show_graphs ? 10 : 5)) + Fx::ub;
 		}
@@ -2103,6 +2245,10 @@ namespace Proc {
 				if (proc_gradient) {
 					g_color = Theme::g("proc").at(clamp(calc * 100 / select_max, 0, 100));
 				}
+			#ifdef CTOP_CLUSTER
+				//? Failing pods read red, pods near their memory limit or OOM-killed before amber
+				if (is_in(p.state, 'E', 'W')) c_color = g_color = Theme::g("cpu").at(p.state == 'E' ? 100 : 60);
+			#endif
 			}
 
 			const auto san_cmd = replace_ascii_control(p.cmd);
@@ -2302,6 +2448,20 @@ namespace Draw {
 		Mem::shown = boxes.contains("mem");
 		Net::shown = boxes.contains("net");
 		Proc::shown = boxes.contains("proc");
+	#ifdef CTOP_CLUSTER
+		Nodes::box.clear();
+		Nodes::height = 0;
+		Nodes::redraw = true;
+		Nodes::shown = boxes.contains("node");
+		Storage::box.clear();
+		Storage::height = 0;
+		Storage::redraw = true;
+		Storage::shown = boxes.contains("storage");
+		Events::box.clear();
+		Events::height = 0;
+		Events::redraw = true;
+		Events::shown = boxes.contains("events");
+	#endif
 
 		//* Calculate and draw cpu box outlines
 		if (Cpu::shown) {
@@ -2410,7 +2570,12 @@ namespace Draw {
 				height += (height+Cpu::height == Term::height-1);
 				height = max(height, b_height_vec[i] + 2);
 				x_vec[i] = 1; y_vec[i] = 1 + total_height + (not Config::getB("cpu_bottom"))*Cpu::shown*Cpu::height;
-				box[i] = createBox(x_vec[i], y_vec[i], width, height, Theme::c("cpu_box"), true, std::string("gpu") + (char)(shown_panels[i]+'0'), "", (shown_panels[i]+5)%10); // TODO gpu_box
+				box[i] = createBox(x_vec[i], y_vec[i], width, height, Theme::c("cpu_box"), true, std::string("gpu") + (char)(shown_panels[i]+'0'), "",
+				#ifdef CTOP_CLUSTER
+					(shown_panels[i]+8)%10); // TODO gpu_box
+				#else
+					(shown_panels[i]+5)%10); // TODO gpu_box
+				#endif
 				b_width = clamp(width/2, min_width, 65);
 				total_height += height;
 
@@ -2543,6 +2708,44 @@ namespace Draw {
 			y = ((cpu_bottom and Cpu::shown) ? 1 : Cpu::height + 1) + Gpu::total_height;
 		#else
 			y = (cpu_bottom and Cpu::shown) ? 1 : Cpu::height + 1;
+		#endif
+		#ifdef CTOP_CLUSTER
+			//? The nodes and storage boxes stack at the top of the proc column, leaving the pod list at least 8 rows
+			if (Nodes::shown) {
+				Nodes::x = x;
+				Nodes::y = y;
+				Nodes::width = width;
+				Nodes::height = clamp((int)Nodes::collect(true).size() + 2, 0, max(0, height - 8));
+				if (Nodes::height >= 3) {
+					Nodes::box = createBox(Nodes::x, Nodes::y, Nodes::width, Nodes::height, Theme::c("cpu_box"), true, "nodes", "", 5);
+					y += Nodes::height;
+					height -= Nodes::height;
+				}
+			}
+			if (Storage::shown) {
+				Storage::x = x;
+				Storage::y = y;
+				Storage::width = width;
+				Storage::sized_rows = Storage::collect(true).size();
+				Storage::height = clamp((int)Storage::sized_rows + 2, 0, max(0, height - 8));
+				if (Storage::height >= 3) {
+					Storage::box = createBox(Storage::x, Storage::y, Storage::width, Storage::height, Theme::c("mem_box"), true, "storage", "", 6);
+					y += Storage::height;
+					height -= Storage::height;
+				}
+			}
+			if (Events::shown) {
+				Events::x = x;
+				Events::y = y;
+				Events::width = width;
+				Events::sized_rows = min(Events::collect(true).size(), Events::max_rows);
+				Events::height = clamp((int)Events::sized_rows + 2, 0, max(0, height - 8));
+				if (Events::height >= 3) {
+					Events::box = createBox(Events::x, Events::y, Events::width, Events::height, Theme::c("net_box"), true, "events", "", 7);
+					y += Events::height;
+					height -= Events::height;
+				}
+			}
 		#endif
 			select_max = height - 3;
 			box = createBox(x, y, width, height, Theme::c("proc_box"), true, "proc", "", 4);
