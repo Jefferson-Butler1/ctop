@@ -34,6 +34,7 @@ using namespace Tools;
 
 namespace Cpu {
     std::optional<std::string> container_engine;
+	vector<string> core_labels;
 
 	string trim_name(string name) {
 		auto name_vec = ssplit(name);

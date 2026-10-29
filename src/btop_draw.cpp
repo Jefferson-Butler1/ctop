@@ -913,8 +913,11 @@ namespace Cpu {
 		if (Shared::coreCount >= 100) core_width++;
 		for (const auto& n : iota(0, Shared::coreCount)) {
 			auto enabled = is_cpu_enabled(n);
-			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + Theme::c(enabled ? "main_fg" : "inactive_fg") + (Shared::coreCount < 100 ? Fx::b + 'C' + Fx::ub : "")
-				+ ljust(to_string(n), core_width);
+			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + Theme::c(enabled ? "main_fg" : "inactive_fg");
+			if (cmp_less(n, Cpu::core_labels.size()))
+				out += Fx::b + Cpu::core_labels[n].substr(0, 1) + Fx::ub + ljust(Cpu::core_labels[n].substr(1), core_width);
+			else
+				out += (Shared::coreCount < 100 ? Fx::b + 'C' + Fx::ub : "") + ljust(to_string(n), core_width);
 			if ((b_column_size > 0 or extra_width > 0) and cmp_less(n, core_graphs.size()))
 				out += Theme::c("inactive_fg") + graph_bg * (5 * b_column_size + extra_width) + Mv::l(5 * b_column_size + extra_width)
 					+ core_graphs.at(n)(safeVal(cpu.core_percent, n), data_same or redraw);
@@ -1714,7 +1717,7 @@ namespace Proc {
 		auto& graph_symbol = (tty_mode ? "tty" : Config::getS("graph_symbol_proc"));
 		auto& graph_bg = Symbols::graph_symbols.at((graph_symbol == "default" ? Config::getS("graph_symbol") + "_up" : graph_symbol + "_up")).at(6);
 		auto mem_bytes = Config::getB("proc_mem_bytes");
-		auto vim_keys = Config::getB("vim_keys");
+		[[maybe_unused]] auto vim_keys = Config::getB("vim_keys");
 		auto show_graphs = Config::getB("proc_cpu_graphs");
 		const auto pause_proc_list = Config::getB("pause_proc_list");
 		auto follow_process = Config::getB("follow_process");
@@ -1844,6 +1847,7 @@ namespace Proc {
 				const string hi_color = (not alive or selected > 0 ? t_color : Theme::c("hi_fg"));
 				int mouse_x = d_x + 2;
 				out += Mv::to(d_y, d_x + 1);
+#ifndef CTOP_CLUSTER // read-only: no signal or nice actions on pods
 				if (width > 55) {
 					out += Fx::ub + title_left + hi_color + Fx::b + 't' + t_color + "erminate" + Fx::ub + title_right;
 					if (alive and selected == 0) Input::mouse_mappings["t"] = {d_y, mouse_x, 1, 9};
@@ -1860,6 +1864,7 @@ namespace Proc {
 					Input::mouse_mappings["N"] = {d_y, mouse_x, 1, 5};
 				    mouse_x += 7;
 				}
+#endif
 				if (width > 77) {
 				    fmt::format_to(std::back_inserter(out), "{}{}{}{}{}{}{}{}",
 				    	title_left, follow_process ? Fx::b : "",
@@ -1955,6 +1960,7 @@ namespace Proc {
 				+ title_left_down + Fx::b + t_color + "info " + hi_color + Symbols::enter + Fx::ub + title_right_down;
 				if (selected > 0) Input::mouse_mappings["info_enter"] = {y + height - 1, mouse_x, 1, 6};
 				mouse_x += 8;
+#ifndef CTOP_CLUSTER // read-only: no signal or nice actions on pods
 			if (width > 60) {
 				out += title_left_down + Fx::b + hi_color + 't' + t_color + "erminate" + Fx::ub + title_right_down;
 				if (selected > 0) Input::mouse_mappings["t"] = {y + height - 1, mouse_x, 1, 9};
@@ -1971,6 +1977,7 @@ namespace Proc {
 		    out += title_left_down + Fx::b + hi_color + 'N' + t_color + "ice" + Fx::ub + title_right_down;
 		    if (selected > 0) Input::mouse_mappings["N"] = {y + height -1, mouse_x, 1, 5};
 			mouse_x += 6;
+#endif
 			if (width > 72) {
 			    fmt::format_to(std::back_inserter(out), "{}{}{}{}{}{}{}{}",
 			    	title_left_down, follow_process ? Fx::b : "",

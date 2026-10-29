@@ -1,3 +1,25 @@
+# ctop
+
+btop for a whole Kubernetes cluster. A fork of btop with one extra collector backend (`src/cluster/`) that reads every node's node-exporter (`:9100`) and the Kubernetes API instead of the local machine. The cluster shows up as one big machine:
+
+* **cpu**: every node's cores appended, labelled by node initial (`p12` = core 12 on the node starting with `p`)
+* **mem**: memory summed across nodes; one disk per node filesystem (`node:/mount`)
+* **net**: one interface per node plus `cluster` (all of them); cycle with `b`/`n`
+* **proc**: pods as processes (namespace as user, images as command); tree mode (`e`) groups pods under their node
+
+It's read-only: signal and nice actions are compiled out, since pod pids are synthetic.
+
+Needs `kubectl` (current context, with metrics-server for pod usage), `curl`, and node-exporter reachable on each node's InternalIP.
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+./build/ctop
+```
+
+`-DCTOP_CLUSTER=OFF` builds stock btop. Config lives in `~/.config/ctop/`.
+
+---
+
 # ![btop++](Img/logo.png)
 
 <a href="https://repology.org/project/btop/versions">

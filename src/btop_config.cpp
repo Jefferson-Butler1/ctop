@@ -68,6 +68,13 @@ const vector<string> Config::disable_preset_options = { "Off", "Default", "Custo
 //* Functions and variables for reading and writing the btop config file
 namespace Config {
 
+	//? Config and log names; the cluster build is ctop so it doesn't share a config with a local btop
+#ifdef CTOP_CLUSTER
+	constexpr auto app_name = "ctop";
+#else
+	constexpr auto app_name = "btop";
+#endif
+
 	atomic<bool> locked (false);
 	atomic<bool> writelock (false);
 	bool write_new;
@@ -406,12 +413,12 @@ namespace Config {
 			std::error_code error;
 			if (const auto xdg_config_home = std::getenv("XDG_CONFIG_HOME"); xdg_config_home != nullptr) {
 				if (fs::exists(xdg_config_home, error)) {
-					config_dir = fs::path(xdg_config_home) / "btop";
+					config_dir = fs::path(xdg_config_home) / app_name;
 				}
 			} else if (const auto home = std::getenv("HOME"); home != nullptr) {
 				error.clear();
 				if (fs::exists(home, error)) {
-					config_dir = fs::path(home) / ".config" / "btop";
+					config_dir = fs::path(home) / ".config" / app_name;
 				}
 				if (error) {
 					fmt::print(stderr, "\033[0;31mWarning: \033[0m{} could not be accessed: {}\n", config_dir.string(), error.message());
@@ -871,7 +878,7 @@ namespace Config {
 	}
 
 	auto get_log_file() -> std::optional<fs::path> {
-		return get_xdg_state_dir().transform([](auto&& state_home) -> auto { return state_home / "btop.log"; });
+		return get_xdg_state_dir().transform([](auto&& state_home) -> auto { return state_home / fmt::format("{}.log", app_name); });
 	}
 
 	auto current_config() -> std::string {

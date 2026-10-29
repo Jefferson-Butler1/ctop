@@ -501,6 +501,7 @@ namespace Input {
 					else
 						keep_going = true;
 				}
+#ifndef CTOP_CLUSTER // pods have synthetic pids, so signalling or renicing them would hit local processes
 				else if (is_in(key, "t", kill_key) and (Config::getB("show_detailed") or Config::getI("selected_pid") > 0)) {
 					atomic_wait(Runner::active);
 					if (Config::getB("show_detailed") and Config::getI("proc_selected") == 0 and Proc::detailed.status == "Dead") return;
@@ -519,6 +520,7 @@ namespace Input {
 				    Menu::show(Menu::Menus::Renice);
 				    return;
 			    }
+#endif
 				else if (is_in(key, "up", "down", "page_up", "page_down", "home", "end") or (vim_keys and is_in(key, "j", "k", "g", "G"))) {
 					proc_mouse_scroll:
 					redraw = false;

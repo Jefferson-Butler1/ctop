@@ -260,6 +260,9 @@ namespace Cpu {
 	auto get_battery() -> tuple<int, float, long, string>;
 
 	string trim_name(string);
+
+	//* Optional per-core labels (cluster backend: node initial + core index), drawn instead of C<n>
+	extern vector<string> core_labels;
 }
 
 namespace Mem {
