@@ -656,7 +656,7 @@ namespace Runner {
 				if (v_contains(conf.boxes, "events") and v_contains(conf.boxes, "proc")) {
 					try {
 						auto rows = Events::collect(conf.no_update);
-						if (min(rows.size(), Events::max_rows) != Events::sized_rows) {
+						if (rows.size() != Events::sized_rows) {
 							Global::resized = true;
 							Input::interrupt();
 						}

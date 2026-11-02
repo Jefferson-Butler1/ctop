@@ -1604,6 +1604,28 @@ namespace Net {
 }
 
 #ifdef CTOP_CLUSTER
+namespace {
+	//? Hands out a row's width column by column, so a narrow box drops or shortens columns instead of drawing past its border
+	struct Columns {
+		int left;
+		bool fits(int w) {
+			if (w > left) return false;
+			left -= w;
+			return true;
+		}
+		int take(int want) {
+			const int w = clamp(want, 0, max(0, left));
+			left -= w;
+			return w;
+		}
+	};
+
+	//? Text in a column of width w, with a space before the next column; nothing when the column was dropped
+	string cell(const string& text, int w) {
+		return w > 0 ? ljust(text, w - 1, true) + ' ' : "";
+	}
+}
+
 namespace Nodes {
 	int x = 1, y, width, height;
 	bool shown = true, redraw = true;
@@ -1616,28 +1638,37 @@ namespace Nodes {
 		out.reserve(width * height);
 		if (redraw) out = box;
 
-		//? name, cpu meter + %, mem meter + %, net, pods, load, requests, flag; meters take whatever width is left
-		const int name_w = 14, flag_w = 15, rest_w = 5 + 6 + 22 + 10 + 10 + 14 + flag_w;
-		const int meter_w = max(4, (width - 2 - name_w - rest_w) / 2);
+		//? name, cpu meter + %, mem meter + %, net, pods, requests, load, flag (only while a node has one). In a narrow box the
+		//? columns after the meters drop, least important first, and the meters take whatever width is left
+		const int name_w = 14, pct_w = 6, min_meter = 4;
+		Columns cols{width - 2 - name_w - 2 * (min_meter + pct_w)};
+		const bool any_flag = rng::any_of(nodes, [](const auto& node) { return not node.flag.empty(); });
+		const bool show_flag = any_flag and cols.fits(15), show_net = cols.fits(22), show_pods = cols.fits(10), show_req = cols.fits(13), show_load = cols.fits(9);
+		//? The meters split what's left; an odd column left over is padded, so a row always reaches the border
+		const int meter_w = min_meter + max(0, cols.left) / 2;
+		const string pad(max(0, cols.left) % 2, ' ');
 		Draw::Meter cpu_meter{meter_w, "cpu"}, mem_meter{meter_w, "used"};
 
 		for (int row = 0; const auto& node : nodes) {
 			if (row >= height - 2) break;
 			const string flag_color = node.flag.empty() ? Theme::c("title") : Theme::g("cpu").at(100);
-			out += Mv::to(y + 1 + row++, x + 1) + flag_color + Fx::b + ljust(node.name, name_w, true) + Fx::ub;
+			out += Mv::to(y + 1 + row++, x + 1) + flag_color + Fx::b + cell(node.name, name_w) + Fx::ub;
 			if (not node.up) {
 				out += Theme::c("inactive_fg") + ljust("down", width - 2 - name_w);
 				continue;
 			}
 			const long long mem_pct = node.mem_total > 0 ? round((double)node.mem_used * 100 / node.mem_total) : 0;
 			out += cpu_meter(node.cpu) + Theme::g("cpu").at(clamp(node.cpu, 0ll, 100ll)) + rjust(to_string(node.cpu), 4) + Theme::c("main_fg") + "% "
-				+ mem_meter(mem_pct) + Theme::g("used").at(clamp(mem_pct, 0ll, 100ll)) + rjust(to_string(mem_pct), 4) + Theme::c("main_fg") + "% "
-				+ Theme::c("main_fg") + " ▼" + rjust(floating_humanizer(node.rx, true, 0, false, true), 9)
-				+ " ▲" + rjust(floating_humanizer(node.tx, true, 0, false, true), 9)
-				+ rjust(to_string(node.pods), 5) + Theme::c("inactive_fg") + " pods"
-				+ Theme::c("main_fg") + rjust(fmt::format("{:.1f}", node.load), 6) + Theme::c("inactive_fg") + " ld"
-				+ " req" + Theme::c("main_fg") + rjust(fmt::format("{}/{}", node.cpu_req, node.mem_req), 8) + Theme::c("inactive_fg") + "%"
-				+ flag_color + Fx::b + rjust(node.flag, flag_w, true) + Fx::ub;
+				+ mem_meter(mem_pct) + Theme::g("used").at(clamp(mem_pct, 0ll, 100ll)) + rjust(to_string(mem_pct), 4) + Theme::c("main_fg") + "% ";
+			if (show_net)
+				out += " ▼" + rjust(floating_humanizer(node.rx, true, 0, false, true), 9) + " ▲" + rjust(floating_humanizer(node.tx, true, 0, false, true), 9);
+			if (show_pods) out += rjust(to_string(node.pods), 5) + Theme::c("inactive_fg") + " pods" + Theme::c("main_fg");
+			if (show_req)
+				out += Theme::c("inactive_fg") + " req" + Theme::c("main_fg") + rjust(fmt::format("{}/{}", node.cpu_req, node.mem_req), 8)
+					+ Theme::c("inactive_fg") + "%" + Theme::c("main_fg");
+			if (show_load) out += rjust(fmt::format("{:.1f}", node.load), 6) + Theme::c("inactive_fg") + " ld";
+			if (show_flag) out += flag_color + Fx::b + rjust(node.flag, 15, true) + Fx::ub;
+			out += pad;
 		}
 
 		redraw = false;
@@ -1658,12 +1689,15 @@ namespace Storage {
 		out.reserve(width * height);
 		if (redraw) out = box;
 
-		//? name, usage meter + %, used/total, read/write, note; the meter takes whatever width is left
-		int name_w = 10;
-		for (const auto& row : rows) name_w = max(name_w, (int)ulen(row.name) + 1);
-		name_w = min(name_w, 34);
-		const int note_w = 22, rest_w = 6 + 16 + 22 + 1 + note_w;
-		Draw::Meter meter{max(4, width - 2 - name_w - rest_w), "used"};
+		//? name, usage meter + %, used/total, read/write, note. In a narrow box the name shortens and the columns after the
+		//? meter drop, least important first; the meter takes whatever width is left
+		const int pct_w = 6, min_meter = 4;
+		int longest = 0;
+		for (const auto& row : rows) longest = max(longest, (int)ulen(row.name));
+		Columns cols{width - 2 - min_meter - pct_w};
+		const int name_w = cols.take(min(max(longest, 9), 33) + 1);
+		const bool show_size = cols.fits(15), show_rates = cols.fits(22), show_note = cols.fits(24);
+		Draw::Meter meter{min_meter + max(0, cols.left), "used"};
 
 		for (int row = 0; row < height - 2; row++) {
 			out += Mv::to(y + 1 + row, x + 1);
@@ -1673,12 +1707,12 @@ namespace Storage {
 			}
 			const auto& r = rows[row];
 			const long long pct = r.total > 0 ? round((double)r.used * 100 / r.total) : 0;
-			out += (r.header ? Theme::c("title") + Fx::b : Theme::c("main_fg")) + ljust(r.name, name_w - 1, true) + Fx::ub + ' '
-				+ meter(pct) + Theme::g("used").at(clamp(pct, 0ll, 100ll)) + rjust(to_string(pct), 4) + Theme::c("main_fg") + "% "
-				+ rjust(floating_humanizer(r.used, true) + "/" + floating_humanizer(r.total, true), 15)
-				+ " ▼" + rjust(floating_humanizer(r.rd, true, 0, false, true), 9)
-				+ " ▲" + rjust(floating_humanizer(r.wr, true, 0, false, true), 9)
-				+ Theme::c("inactive_fg") + "  " + ljust(r.note, note_w, true);
+			out += (r.header ? Theme::c("title") + Fx::b : Theme::c("main_fg")) + cell(r.name, name_w) + Fx::ub
+				+ meter(pct) + Theme::g("used").at(clamp(pct, 0ll, 100ll)) + rjust(to_string(pct), 4) + Theme::c("main_fg") + "% ";
+			if (show_size) out += rjust(floating_humanizer(r.used, true) + "/" + floating_humanizer(r.total, true), 15);
+			if (show_rates)
+				out += " ▼" + rjust(floating_humanizer(r.rd, true, 0, false, true), 9) + " ▲" + rjust(floating_humanizer(r.wr, true, 0, false, true), 9);
+			if (show_note) out += Theme::c("inactive_fg") + "  " + ljust(r.note, 22, true);
 		}
 
 		redraw = false;
@@ -1699,9 +1733,11 @@ namespace Events {
 		out.reserve(width * height);
 		if (redraw) out = box;
 
-		//? age, source, object, reason (×count), message; the message takes whatever width is left
-		const int age_w = 5, source_w = 16, object_w = 34, reason_w = 24;
-		const int message_w = max(0, width - 2 - age_w - source_w - object_w - reason_w - 4);
+		//? age, source, object, reason (×count), message. A narrow box keeps the object and reason, dropping the source and
+		//? then the message; the message takes whatever width is left
+		Columns cols{width - 2};
+		const int age_w = cols.take(6), object_w = cols.take(clamp(cols.left - 24, 16, 34)), reason_w = cols.take(24), source_w = cols.take(16);
+		const int message_w = cols.left;
 		const auto now = time(nullptr);
 		for (int row = 0; row < height - 2; row++) {
 			out += Mv::to(y + 1 + row, x + 1);
@@ -1710,18 +1746,17 @@ namespace Events {
 				continue;
 			}
 			const auto& e = rows[row];
-			//? Flux's summary and ongoing conditions (Flux, Ceph) stand out from the event log
+			//? Ongoing conditions (Flux, Ceph) stand out from the event log, and the summary row from both
 			const bool ongoing = is_in(e.source, "flux", "ceph");
 			const time_t secs = max<time_t>(0, now - e.at);
 			const string age = e.at <= 0 ? "" : secs < 60 ? fmt::format("{}s", secs) : secs < 3600 ? fmt::format("{}m", secs / 60)
 				: secs < 86400 ? fmt::format("{}h", secs / 3600) : fmt::format("{}d", secs / 86400);
 			const string reason = e.count > 1 ? fmt::format("{} ×{}", e.reason, e.count) : e.reason;
-			out += Theme::c("inactive_fg") + rjust(age, age_w, true) + ' '
-				+ (row == 0 ? Theme::c("title") + Fx::b : ongoing ? Theme::g("cpu").at(100) + Fx::b : Theme::c("main_fg"))
-				+ ljust(e.source, source_w - 1, true) + Fx::ub + ' '
-				+ Theme::c("main_fg") + ljust(e.object, object_w - 1, true) + ' '
-				+ (row == 0 ? Theme::c("main_fg") : Theme::g("cpu").at(ongoing ? 100 : 60)) + ljust(reason, reason_w - 1, true) + ' '
-				+ Theme::c("inactive_fg") + ljust(e.message, message_w, true);
+			out += Theme::c("inactive_fg") + (age_w > 0 ? rjust(age, age_w - 1, true) + ' ' : "")
+				+ (ongoing ? Theme::g("cpu").at(100) + Fx::b : Theme::c("main_fg")) + cell(e.source, source_w) + Fx::ub
+				+ (row == 0 ? Theme::c("title") + Fx::b : Theme::c("main_fg")) + cell(e.object, object_w) + Fx::ub
+				+ (row == 0 ? Theme::c("main_fg") : Theme::g("cpu").at(ongoing ? 100 : 60)) + cell(reason, reason_w)
+				+ Theme::c("inactive_fg") + (message_w > 0 ? ljust(e.message, message_w, true) : "");
 		}
 
 		redraw = false;
@@ -2738,7 +2773,7 @@ namespace Draw {
 				Events::x = x;
 				Events::y = y;
 				Events::width = width;
-				Events::sized_rows = min(Events::collect(true).size(), Events::max_rows);
+				Events::sized_rows = Events::collect(true).size();
 				Events::height = clamp((int)Events::sized_rows + 2, 0, max(0, height - 8));
 				if (Events::height >= 3) {
 					Events::box = createBox(Events::x, Events::y, Events::width, Events::height, Theme::c("net_box"), true, "events", "", 7);

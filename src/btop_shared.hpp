@@ -407,7 +407,6 @@ namespace Events {
 	extern int x, y, width, height;
 	extern bool shown, redraw;
 	extern size_t sized_rows;
-	constexpr size_t max_rows = 10;
 
 	struct event_info {
 		string source, object, reason, message; // source: "flux", "ceph" or the event's namespace
@@ -415,7 +414,7 @@ namespace Events {
 		size_t count{};
 	};
 
-	//? The first row is always Flux's summary
+	//? The first row is always Flux's summary (object "flux"); at most ten rows, the most pressing first
 	auto collect(bool no_update = false) -> vector<event_info>&;
 	string draw(const vector<event_info>& rows, bool force_redraw = false, bool data_same = false);
 }
